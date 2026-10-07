@@ -32,11 +32,11 @@ except ModuleNotFoundError:
     sys.exit(1)
 
 
-VERSION = "0.9.41-BETA"
+VERSION = "0.9.42-BETA"
 
 GAME_ID = 10640
 API_BASE = f"https://g-{GAME_ID}.modapi.io/v1"
-USER_AGENT = f"TF3-Mod-Downloader/{VERSION}"
+USER_AGENT = f"TpF3-Mod-Downloader/{VERSION}"
 
 MAX_RETRIES = 3
 MAX_DOWNLOAD_RETRIES = 3
@@ -60,6 +60,10 @@ KNOWN_CDN_SUFFIXES = (
 )
 
 RETRYABLE_API_STATUSES = (429, 500, 502, 503, 504)
+
+# Платформа, для которой скачиваем файлы (значение заголовка X-Modio-Platform).
+# У мода могут быть отдельные файлы под разные платформы (Windows, консоли, Linux).
+TARGET_PLATFORM = "windows"
 
 # API-ключ mod.io: по документации — 32 символа.
 API_KEY_LENGTH = 32
@@ -105,6 +109,7 @@ _SESSION = requests.Session()
 _SESSION.headers.update({
     "User-Agent": USER_AGENT,
     "Accept": "application/json",
+    "X-Modio-Platform": TARGET_PLATFORM,
 })
 # ---------------------------------
 
@@ -177,6 +182,7 @@ def _prompt_api_key(show_help=True):
         print("Вводи его точно, без пробелов и кавычек.")
         print(f"Ключ состоит из {API_KEY_LENGTH} символов; взять его можно на https://mod.io/me/access")
         print("Вставь ключ и нажми Enter.")
+        print()
     key = _clean_key(getpass.getpass("API key mod.io: "))
 
     if key:
@@ -208,6 +214,7 @@ def get_api_key():
     вручную (скрытый ввод, до MAX_KEY_ATTEMPTS попыток)."""
     env_key = _clean_key(os.environ.get("MODIO_API_KEY"))
 
+    print()
     if env_key:
         print("Проверяю ключ из переменной MODIO_API_KEY...")
         if _key_is_valid(env_key):
@@ -219,6 +226,7 @@ def get_api_key():
         print("Введи ключ вручную. Саму переменную потом нужно исправить.")
     else:
         print("API key не найден в переменной окружения.")
+        print()
         print("Чтобы не вводить его каждый раз, задай переменную MODIO_API_KEY.")
         print("В обычной командной строке: setx MODIO_API_KEY \"ключ\"")
         print("Также можно через настройки Windows - «переменные среды»")
@@ -870,8 +878,165 @@ def api_get(path, api_key, params=None):
             ) from None
 
 
+def _platform_entries(item):
+    """Список (ПЛАТФОРМА, статус) из поля platforms файла.
+    Пустой, если игра не использует платформы или поле имеет другой вид."""
+    result = []
+    platforms = item.get("platforms") if isinstance(item, dict) else None
+
+    if not isinstance(platforms, list):
+        return result
+
+    for entry in platforms:
+        if not isinstance(entry, dict):
+            continue
+
+        name = str(entry.get("platform") or "").strip().upper()
+
+        if name:
+            result.append((name, entry.get("status")))
+
+    return result
+
+
+def _platforms_text(item):
+    """«WINDOWS, LINUX» — платформы файла для вывода на экран."""
+    names = []
+
+    for name, _ in _platform_entries(item):
+        if name not in names:
+            names.append(name)
+
+    return ", ".join(names)
+
+
+def _file_fits_target(item):
+    """True — файл подходит или платформы у него не указаны (проверять нечего).
+    False — платформы указаны, но нашей среди них нет (или она отклонена)."""
+    entries = _platform_entries(item)
+
+    if not entries:
+        return True
+
+    for name, status in entries:
+        if name in (TARGET_PLATFORM.upper(), "ALL") and status != 2:  # 2 = DENIED
+            return True
+
+    return False
+
+
+def _live_file_id_for_target(mod):
+    """ID файла, который mod.io считает «живым» для нашей платформы.
+    Берётся из mod['platforms'] (есть, только если игра включила платформы)."""
+    platforms = mod.get("platforms") if isinstance(mod, dict) else None
+
+    if not isinstance(platforms, list):
+        return None
+
+    fallback = None
+
+    for entry in platforms:
+        if not isinstance(entry, dict):
+            continue
+
+        name = str(entry.get("platform") or "").strip().upper()
+        file_id = safe_non_negative_int(entry.get("modfile_live"))
+
+        if not file_id:
+            continue
+
+        if name == TARGET_PLATFORM.upper():
+            return file_id
+
+        if name == "ALL" and fallback is None:
+            fallback = file_id
+
+    return fallback
+
+
+def _find_target_file(mod_id, api_key):
+    """Ищет среди файлов мода самый свежий файл для нашей платформы."""
+    data = api_get(
+        f"/games/{GAME_ID}/mods/{mod_id}/files",
+        api_key,
+        {"_limit": 100},
+    )
+
+    files = data.get("data") if isinstance(data, dict) else None
+
+    if not isinstance(files, list):
+        return None
+
+    best = None
+
+    for item in files:
+        # Без сведений о платформах нельзя утверждать, что файл для Windows.
+        if not _platform_entries(item) or not _file_fits_target(item):
+            continue
+
+        added = safe_non_negative_int(item.get("date_added")) or 0
+
+        if best is None or added > best[0]:
+            best = (added, item)
+
+    return best[1] if best else None
+
+
+def _ask_yes_no(question):
+    """Вопрос да/нет. EOFError пробрасывается наружу."""
+    while True:
+        answer = input(f"{question} (y/n): ").strip().lower()
+
+        if answer in ("y", "yes", "д", "да"):
+            return True
+
+        if answer in ("n", "no", "н", "нет"):
+            return False
+
+        print("Ответь y или n.")
+
+
+def resolve_file_info(mod, mod_id, api_key, ask=True):
+    """Выбирает файл мода для нашей платформы. Возвращает (file_id, file_info).
+
+    Если подходящего файла нет и пользователь отказался скачивать
+    «не тот» файл, возвращает (None, None)."""
+    file_id = get_current_file_id(mod, api_key)
+    file_info = fetch_file_info(mod_id, file_id, api_key)
+
+    if _file_fits_target(file_info):
+        return file_id, file_info
+
+    print()
+    print(
+        f"Текущий файл мода ({file_info.get('filename')}) "
+        f"помечен для: {_platforms_text(file_info)}."
+    )
+    print(f"Ищу среди файлов мода версию для {TARGET_PLATFORM.capitalize()}...")
+
+    other = _find_target_file(mod_id, api_key)
+    other_id = safe_non_negative_int(other.get("id")) if other else None
+
+    if other_id:
+        other_info = fetch_file_info(mod_id, other_id, api_key)
+        print(f"Найден файл: {other_info.get('filename')}")
+        return other_id, other_info
+
+    print(f"Файл для {TARGET_PLATFORM.capitalize()} не найден.")
+
+    if ask and not _ask_yes_no("Всё равно скачать текущий файл?"):
+        return None, None
+
+    return file_id, file_info
+
+
 def get_current_file_id(mod, api_key):
-    """Достаёт ID текущего файла мода."""
+    """Достаёт ID текущего файла мода (для нашей платформы, если она известна)."""
+    live_id = _live_file_id_for_target(mod)
+
+    if live_id:
+        return live_id
+
     modfile = mod.get("modfile")
 
     if isinstance(modfile, dict):
@@ -1633,15 +1798,17 @@ def extract_zip(zip_path, extract_root, mod_name=None, name_mode=MODE_NAME_AUTO,
                 # с его же контрольной суммой. К символам и длине пути
                 # это отношения не имеет.
                 raise RuntimeError(
-                    "Архив повреждён внутри: данные файла не сходятся "
+                    "Архив повреждён внутри! Данные файла не сходятся "
                     "с контрольной суммой (CRC).\n"
                     f"Причина: {e}\n"
                     "Если при скачивании было «Проверка MD5: OK», файл "
-                    "совпадает с тем, что лежит на mod.io, то есть архив "
-                    "битый у источника.\n"
-                    "Повторное скачивание не поможет — напиши автору мода, "
-                    "чтобы перезалил файл."
+                    "совпадает с тем, что лежит на mod.io.\n"
+                    "Скорее всего, архив битый у источника. "
+                    "Повторное скачивание не поможет.\n"
+                    "Проверь архив в 7-Zip («Тестировать»): если он тоже "
+                    "ругается, напиши автору мода, чтобы перезалил файл."
                     + old_note
+                    + "\n\nМожно распаковать вручную, но на свой страх и риск!"
                 ) from e
             except (EOFError, zlib.error) as e:
                 # EOFError нельзя пропускать как есть: выше по стеку он
@@ -1682,7 +1849,7 @@ def extract_zip(zip_path, extract_root, mod_name=None, name_mode=MODE_NAME_AUTO,
                     ) from e
 
                 raise RuntimeError(
-                    f"Не удалось распаковать архив: {e}" + old_note
+                    f"Неожиданная ошибка: {e}" + old_note
                 ) from e
 
             source = (tmp_path / top_name) if single_folder else tmp_path
@@ -1886,8 +2053,9 @@ def download_mod(mod, api_key, output_dir, file_info, mod_name=None,
             print(f"Временная ссылка на файл больше не работает ({e}).")
             print("Получаю свежую ссылку и пробую ещё раз...")
 
-            file_id = get_current_file_id(mod, api_key)
-            file_info = fetch_file_info(mod_id, file_id, api_key)
+            file_id, file_info = resolve_file_info(
+                mod, mod_id, api_key, ask=False
+            )
 
     extract_status = None
 
@@ -1933,7 +2101,10 @@ def download_mod(mod, api_key, output_dir, file_info, mod_name=None,
                 print(f"ZIP остался здесь: {zip_path}")
                 extract_status = STATUS_CANCELLED
             except Exception as e:
-                print(f"Не удалось распаковать: {e}")
+                print()
+                print("Не удалось распаковать:")
+                print(e)
+                print()
                 print(f"ZIP остался здесь: {zip_path}")
                 extract_status = STATUS_FAILED
 
@@ -1959,8 +2130,12 @@ def process_dependencies(dependencies, api_key, downloads, name_mode, issues):
                 or dep_name
             )
 
-            dep_file_id = get_current_file_id(dep_mod, api_key)
-            dep_file_info = fetch_file_info(dep_id, dep_file_id, api_key)
+            _, dep_file_info = resolve_file_info(dep_mod, dep_id, api_key)
+
+            if dep_file_info is None:
+                raise RuntimeError(
+                    f"для зависимости нет файла для {TARGET_PLATFORM.capitalize()}"
+                )
 
             _, dep_status = download_mod(
                 dep_mod, api_key, downloads, dep_file_info,
@@ -2132,10 +2307,18 @@ def process_one_url(api_key, file_mode, name_mode, initial_url=None):
     print(f"Название : {mod_name}")
     print(f"Mod ID   : {mod_id}")
 
-    file_id = get_current_file_id(mod, api_key)
-    print(f"File ID  : {file_id}")
     print("Получаю свежую ссылку на ZIP...")
-    file_info = fetch_file_info(mod_id, file_id, api_key)
+    file_id, file_info = resolve_file_info(mod, mod_id, api_key)
+
+    if file_info is None:
+        return "retry_url"
+
+    print(f"File ID  : {file_id}")
+
+    platforms_text = _platforms_text(file_info)
+
+    if platforms_text:
+        print(f"Платформы: {platforms_text}")
 
     deps_to_install = []
 
@@ -2296,7 +2479,7 @@ def process_one_url(api_key, file_mode, name_mode, initial_url=None):
 def main():
     """Диспетчер: выбирает режимы, ключ, и запускает обработку ссылок."""
     print("=" * 60)
-    print(f"Transport Fever 3 — mod.io ZIP Downloader v{VERSION}")
+    print(f"Transport Fever 3 — Mod Downloader v{VERSION}")
     print("=" * 60)
     print()
 
