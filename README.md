@@ -19,7 +19,7 @@
 - Windows
 - Python 3.11 или новее ([python.org](https://www.python.org/downloads/)), при установке отметь «Add Python to PATH»
 - пакет `requests` (если его нет, `.bat`-файл предложит установить)
-- **личный API-ключ mod.io** (бесплатный, выдаётся по запросу, см. ниже)
+- **личный API-ключ mod.io** (см. ниже)
 
 ## Как получить API-ключ mod.io
 
