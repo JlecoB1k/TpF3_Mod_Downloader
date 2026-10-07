@@ -2479,7 +2479,7 @@ def process_one_url(api_key, file_mode, name_mode, initial_url=None):
 def main():
     """Диспетчер: выбирает режимы, ключ, и запускает обработку ссылок."""
     print("=" * 60)
-    print(f"Transport Fever 3 — Mod Downloader v{VERSION}")
+    print(f"Transport Fever 3 — Mod Downloader v{VERSION} by JlecoB1k")
     print("=" * 60)
     print()
 
