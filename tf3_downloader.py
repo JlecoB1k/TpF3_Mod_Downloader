@@ -4,12 +4,14 @@ import os
 import random
 import re
 import shutil
+import struct
 import sys
 import tempfile
 import time
 import zipfile
 import zlib
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse, quote, quote_plus
 
@@ -32,7 +34,7 @@ except ModuleNotFoundError:
     sys.exit(1)
 
 
-VERSION = "0.9.42-BETA"
+VERSION = "0.9.45-BETA"
 
 GAME_ID = 10640
 API_BASE = f"https://g-{GAME_ID}.modapi.io/v1"
@@ -85,6 +87,13 @@ STATUS_ALREADY = "already"
 STATUS_CANCELLED = "cancelled"
 STATUS_FAILED = "failed"
 STATUS_NOT_ZIP = "not_zip"
+STATUS_EXTRACTED_CRC = "extracted_crc"
+
+# Сколько раз пробуем скачать файл, если MD5 не совпал (первая попытка + повтор).
+MAX_MD5_ATTEMPTS = 2
+
+# Сколько файлов с ошибкой CRC показывать списком (остальные — «…и ещё N»).
+CRC_LIST_LIMIT = 5
 # ----------------------------------------
 
 # ---------- Режимы ----------
@@ -129,6 +138,10 @@ class RetryableDownloadHTTPError(Exception):
         self.status_code = status_code
         self.retry_after = retry_after
         super().__init__(f"CDN HTTP {status_code}")
+
+
+class Md5Mismatch(Exception):
+    """Скачанный файл не совпал с MD5, который сообщил mod.io."""
 
 
 class DownloadCancelled(Exception):
@@ -970,8 +983,10 @@ def _find_target_file(mod_id, api_key):
     best = None
 
     for item in files:
-        # Без сведений о платформах нельзя утверждать, что файл для Windows.
-        if not _platform_entries(item) or not _file_fits_target(item):
+        # _file_fits_target уже считает файл подходящим, если platforms
+        # пуст (проверять нечего) или наша платформа/ALL не отклонена.
+        # Раньше пустой platforms отсекался здесь и ломал автопоиск.
+        if not _file_fits_target(item):
             continue
 
         added = safe_non_negative_int(item.get("date_added")) or 0
@@ -985,7 +1000,7 @@ def _find_target_file(mod_id, api_key):
 def _ask_yes_no(question):
     """Вопрос да/нет. EOFError пробрасывается наружу."""
     while True:
-        answer = input(f"{question} (y/n): ").strip().lower()
+        answer = input(f"{question} (да/нет):\n> ").strip().lower()
 
         if answer in ("y", "yes", "д", "да"):
             return True
@@ -993,7 +1008,7 @@ def _ask_yes_no(question):
         if answer in ("n", "no", "н", "нет"):
             return False
 
-        print("Ответь y или n.")
+        print("Ответь «да» или «нет».")
 
 
 def resolve_file_info(mod, mod_id, api_key, ask=True):
@@ -1279,6 +1294,13 @@ def _check_zip_path_length(path):
         )
 
 
+_MD5_MISMATCH_TEXT = (
+    "Контрольная сумма MD5 не совпала.\n"
+    "Файл мог повредиться при загрузке или обновиться на mod.io.\n"
+    "Попробуй скачать ещё раз, а если не поможет, повтори через несколько минут."
+)
+
+
 def download_zip(file_info, output_dir, fallback_name, api_key=None):
     """Скачивает ZIP во временный .part, проверяет размер и MD5,
     потом переименовывает. При обрыве сети — несколько попыток.
@@ -1398,159 +1420,180 @@ def download_zip(file_info, output_dir, fallback_name, api_key=None):
     print()
 
     last_error = None
+    # Внешний цикл — повторы из‑за MD5; внутренний — сеть/HTTP.
+    # Раньше один счётчик attempt делил оба лимита, и после сетевых
+    # retry второй MD5-повтор мог не состояться.
+    download_ok = False
 
-    for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
-        md5 = hashlib.md5()
-        total = 0
-        server_size = None
+    for md5_attempt in range(1, MAX_MD5_ATTEMPTS + 1):
+        for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
+            md5 = hashlib.md5()
+            total = 0
+            server_size = None
 
-        try:
-            if attempt == 1:
-                print_progress("Подключаюсь к серверу загрузки...")
-            else:
-                print_progress(
-                    "Подключаюсь к серверу загрузки "
-                    f"(попытка {attempt}/{MAX_DOWNLOAD_RETRIES})..."
-                )
-
-            with _SESSION.get(
-                binary_url,
-                headers={
-                    "Accept-Encoding": "identity",
-                    "Accept": "*/*",
-                },
-                stream=True,
-                timeout=(15, 90),
-            ) as response:
-
-                if response.status_code in (401, 403):
-                    raise ExpiredDownloadLink(
-                        f"сервер ответил HTTP {response.status_code}"
+            try:
+                if attempt == 1 and md5_attempt == 1:
+                    print_progress("Подключаюсь к серверу загрузки...")
+                else:
+                    print_progress(
+                        "Подключаюсь к серверу загрузки "
+                        f"(попытка {attempt}/{MAX_DOWNLOAD_RETRIES})..."
                     )
 
-                if response.status_code == 429 or response.status_code >= 500:
-                    retry_after = None
-                    if response.status_code == 429:
-                        raw_ra = response.headers.get("Retry-After", "")
-                        try:
-                            retry_after = int(raw_ra)
-                        except (ValueError, TypeError):
-                            retry_after = None
-                    raise RetryableDownloadHTTPError(
-                        response.status_code, retry_after
+                with _SESSION.get(
+                    binary_url,
+                    headers={
+                        "Accept-Encoding": "identity",
+                        "Accept": "*/*",
+                    },
+                    stream=True,
+                    timeout=(15, 90),
+                ) as response:
+
+                    if response.status_code in (401, 403):
+                        raise ExpiredDownloadLink(
+                            f"сервер ответил HTTP {response.status_code}"
+                        )
+
+                    if response.status_code == 429 or response.status_code >= 500:
+                        retry_after = None
+                        if response.status_code == 429:
+                            raw_ra = response.headers.get("Retry-After", "")
+                            try:
+                                retry_after = int(raw_ra)
+                            except (ValueError, TypeError):
+                                retry_after = None
+                        raise RetryableDownloadHTTPError(
+                            response.status_code, retry_after
+                        )
+
+                    if response.status_code != 200:
+                        raise RuntimeError(
+                            f"CDN ответил HTTP {response.status_code} "
+                            "(подробности URL скрыты — там может быть токен ссылки)"
+                        )
+
+                    server_size = parse_content_length(
+                        response.headers.get("Content-Length")
                     )
 
-                if response.status_code != 200:
-                    raise RuntimeError(
-                        f"CDN ответил HTTP {response.status_code} "
-                        "(подробности URL скрыты — там может быть токен ссылки)"
+                    if (
+                        server_size is not None
+                        and filesize is not None
+                        and server_size != filesize
+                    ):
+                        raise RuntimeError(
+                            f"Файл на сервере изменился: ожидалось {filesize:,} байт, "
+                            f"сервер отдаёт {server_size:,} байт.\n"
+                            "Скорее всего, автор только что обновил мод. "
+                            "Запусти скрипт ещё раз."
+                        )
+
+                    print_progress("Соединение установлено, жду данные...")
+
+                    last_update = 0.0
+                    with open(tmp_path, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=64 * 1024):
+                            if not chunk:
+                                continue
+
+                            f.write(chunk)
+                            md5.update(chunk)
+                            total += len(chunk)
+
+                            now = time.monotonic()
+                            if now - last_update >= 0.2:
+                                last_update = now
+                                _print_download_progress(total, filesize)
+
+                    _print_download_progress(total, filesize)
+
+                if filesize is not None and total != filesize:
+                    raise IncompleteDownload(
+                        f"получено {total:,} из {filesize:,} байт (по метаданным mod.io)"
                     )
 
-                server_size = parse_content_length(
-                    response.headers.get("Content-Length")
-                )
-
-                if (
-                    server_size is not None
-                    and filesize is not None
-                    and server_size != filesize
-                ):
-                    raise RuntimeError(
-                        f"Файл на сервере изменился: ожидалось {filesize:,} байт, "
-                        f"сервер отдаёт {server_size:,} байт.\n"
-                        "Скорее всего, автор только что обновил мод. "
-                        "Запусти скрипт ещё раз."
+                if server_size is not None and total != server_size:
+                    raise IncompleteDownload(
+                        f"получено {total:,} из {server_size:,} байт "
+                        "(по заголовку сервера)"
                     )
 
-                print_progress("Соединение установлено, жду данные...")
+                if expected_md5 and md5.hexdigest().lower() != expected_md5.lower():
+                    raise Md5Mismatch()
 
-                last_update = 0.0
-                with open(tmp_path, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=64 * 1024):
-                        if not chunk:
-                            continue
+                print()
+                print()
+                download_ok = True
+                break
 
-                        f.write(chunk)
-                        md5.update(chunk)
-                        total += len(chunk)
+            except Md5Mismatch:
+                print()
+                if md5_attempt < MAX_MD5_ATTEMPTS:
+                    print("Контрольная сумма MD5 не совпала, скачиваю ещё раз...")
+                    break  # выходим из сетевого цикла → следующий md5_attempt
 
-                        now = time.monotonic()
-                        if now - last_update >= 0.2:
-                            last_update = now
-                            _print_download_progress(total, filesize)
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise RuntimeError(_MD5_MISMATCH_TEXT) from None
 
-                _print_download_progress(total, filesize)
+            except (RetryableDownloadHTTPError,
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout,
+                    requests.exceptions.ChunkedEncodingError,
+                    IncompleteDownload) as e:
+                # Один общий обработчик для всех retryable-ошибок.
+                # Сообщение о повторе печатает _print_retry_message.
+                last_error = e
+                print()
+                if attempt < MAX_DOWNLOAD_RETRIES:
+                    wait = _print_retry_message(e, attempt)
+                    time.sleep(wait)
+                    continue
 
-            if filesize is not None and total != filesize:
-                raise IncompleteDownload(
-                    f"получено {total:,} из {filesize:,} байт (по метаданным mod.io)"
-                )
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    f"Не удалось скачать после {MAX_DOWNLOAD_RETRIES} попыток.\n"
+                    "Проверь соединение и запусти скрипт ещё раз."
+                ) from last_error
 
-            if server_size is not None and total != server_size:
-                raise IncompleteDownload(
-                    f"получено {total:,} из {server_size:,} байт "
-                    "(по заголовку сервера)"
-                )
+            except requests.exceptions.RequestException as e:
+                # Прочие ошибки requests (InvalidURL, MissingSchema,
+                # битая схема). Не retryable — падаем сразу, но маскируем
+                # binary_url в тексте, там может быть токен.
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
-            print()
-            print()
+                msg = str(e)
+                if binary_url:
+                    safe = mask_url(binary_url, api_key)
+                    msg = msg.replace(binary_url, safe)
+
+                raise RuntimeError(
+                    f"Ошибка обращения к CDN:\n{msg}"
+                ) from None
+
+            except BaseException:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+
+        if download_ok:
             break
-
-        except (RetryableDownloadHTTPError,
-                requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout,
-                requests.exceptions.ChunkedEncodingError,
-                IncompleteDownload) as e:
-            # Один общий обработчик для всех retryable-ошибок.
-            # Сообщение о повторе печатает _print_retry_message.
-            last_error = e
-            print()
-            if attempt < MAX_DOWNLOAD_RETRIES:
-                wait = _print_retry_message(e, attempt)
-                time.sleep(wait)
-                continue
-
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise RuntimeError(
-                f"Не удалось скачать после {MAX_DOWNLOAD_RETRIES} попыток.\n"
-                "Проверь соединение и запусти скрипт ещё раз."
-            ) from last_error
-
-        except requests.exceptions.RequestException as e:
-            # Прочие ошибки requests (InvalidURL, MissingSchema,
-            # битая схема). Не retryable — падаем сразу, но маскируем
-            # binary_url в тексте, там может быть токен.
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-            msg = str(e)
-            if binary_url:
-                safe = mask_url(binary_url, api_key)
-                msg = msg.replace(binary_url, safe)
-
-            raise RuntimeError(
-                f"Ошибка обращения к CDN:\n{msg}"
-            ) from None
-
-        except BaseException:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
 
     try:
         if expected_md5:
             if md5.hexdigest().lower() != expected_md5.lower():
-                raise RuntimeError(
-                    "Контрольная сумма MD5 не совпала — файл повреждён при загрузке.\n"
-                    "Попробуй скачать ещё раз."
-                )
+                raise RuntimeError(_MD5_MISMATCH_TEXT)
             print("Проверка MD5: OK")
         else:
             print("Проверка MD5: пропущена (mod.io не передал хэш)")
@@ -1574,14 +1617,196 @@ def download_zip(file_info, output_dir, fallback_name, api_key=None):
     return output_path, False
 
 
+_LOCAL_HEADER = struct.Struct("<4s5H3L2H")  # локальный заголовок файла в ZIP
+
+
+def _can_skip_crc_check():
+    """Можно ли в этой версии Python отключить проверку CRC при распаковке.
+
+    Опирается на приватный метод CPython. Если его не станет —
+    просто не предлагаем обход; обычная распаковка не ломается.
+    """
+    fn = getattr(zipfile.ZipExtFile, "_update_crc", None)
+    return callable(fn)
+
+
+@contextmanager
+def _crc_check_disabled():
+    """Временно отключает сверку CRC в zipfile.
+
+    Только для однопоточного CLI. Патч классовый, откат — в finally
+    (через contextmanager), чтобы метод не остался подменённым.
+    """
+    original = zipfile.ZipExtFile._update_crc
+    zipfile.ZipExtFile._update_crc = lambda self, *args, **kwargs: None
+    try:
+        yield
+    finally:
+        zipfile.ZipExtFile._update_crc = original
+
+
+def _extract_without_crc_check(zf, tmp_path, members):
+    """Распаковывает файлы, временно отключив сверку CRC в zipfile.
+
+    Всё остальное (имена, сжатие, размеры) проверяется как обычно.
+
+    Приватный API CPython: нужен, чтобы обойти битый CRC у части модов
+    на mod.io (данные часто целые). Если метода не станет —
+    _can_skip_crc_check() вернёт False, и мы не предложим этот путь.
+    """
+    with _crc_check_disabled():
+        zf.extractall(tmp_path, members=members)
+
+
+def _check_member_crc(raw, info):
+    """Проверяет один файл в архиве, ничего не распаковывая на диск.
+
+    Возвращает:
+      "ok"      — всё сходится;
+      "crc"     — данные распаковались, длина верна, не сходится только CRC;
+      "broken"  — данные повреждены (не распаковываются, не та длина, обрезано);
+      "unknown" — проверить не умеем (шифрование, редкий метод сжатия).
+    """
+    if info.flag_bits & 0x1:
+        return "unknown"
+
+    if info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+        return "unknown"
+
+    try:
+        raw.seek(info.header_offset)
+        header = raw.read(_LOCAL_HEADER.size)
+
+        if len(header) < _LOCAL_HEADER.size:
+            return "broken"
+
+        fields = _LOCAL_HEADER.unpack(header)
+
+        if fields[0] != b"PK\x03\x04":
+            return "broken"
+
+        raw.seek(info.header_offset + _LOCAL_HEADER.size + fields[9] + fields[10])
+
+        decomp = (
+            zlib.decompressobj(-15)
+            if info.compress_type == zipfile.ZIP_DEFLATED else None
+        )
+        remaining = info.compress_size
+        crc = 0
+        size = 0
+
+        while remaining > 0:
+            chunk = raw.read(min(1 << 20, remaining))
+
+            if not chunk:
+                return "broken"
+
+            remaining -= len(chunk)
+
+            if decomp is None:
+                crc = zlib.crc32(chunk, crc)
+                size += len(chunk)
+                continue
+
+            pending = chunk
+            while pending:
+                data = decomp.decompress(pending, 1 << 22)
+                crc = zlib.crc32(data, crc)
+                size += len(data)
+
+                new_pending = decomp.unconsumed_tail
+                if decomp.eof or (not data and new_pending == pending):
+                    break
+                pending = new_pending
+
+        if decomp is not None:
+            data = decomp.flush()
+            crc = zlib.crc32(data, crc)
+            size += len(data)
+
+    except (OSError, zlib.error, struct.error):
+        return "broken"
+
+    if size != info.file_size:
+        return "broken"
+
+    return "ok" if (crc & 0xFFFFFFFF) == info.CRC else "crc"
+
+
+def _find_crc_only_problems(zip_path, files):
+    """Имена файлов, у которых не сходится только CRC.
+
+    Пустой список — если таких нет или в архиве есть настоящая порча
+    (или файлы, которые мы не умеем проверить): тогда продолжать нельзя."""
+    crc_names = []
+
+    try:
+        with open(zip_path, "rb") as raw:
+            for info in files:
+                result = _check_member_crc(raw, info)
+
+                if result == "crc":
+                    crc_names.append(info.filename)
+                elif result in ("broken", "unknown"):
+                    return []
+    except OSError:
+        return []
+
+    return crc_names
+
+
+def _show_crc_warning(crc_names, total_files, md5_verified):
+    """Окно с предупреждением об ошибках CRC в архиве."""
+    print()
+    print("=" * 60)
+    print("Внимание! Контрольные суммы в архиве не сходятся.")
+    print("=" * 60)
+    print(f"Файлов с ошибкой CRC: {len(crc_names)} из {total_files}")
+
+    for name in crc_names[:CRC_LIST_LIMIT]:
+        print(f"- {name}")
+
+    rest = len(crc_names) - CRC_LIST_LIMIT
+    if rest > 0:
+        print(f"…и ещё {rest}")
+
+    print()
+
+    if md5_verified:
+        print("Скачивание прошло без ошибок («Проверка MD5: OK»).")
+        print("Файл соответствует тому, что сейчас лежит на mod.io.")
+        print("Подобное встречается у многих модов.")
+        print("Вероятнее всего это связано с программой, которой автор упаковал мод.")
+    else:
+        print("Проверка MD5 пропущена: mod.io не передал контрольную сумму.")
+        print("Поэтому нельзя исключить, что файл повредился при скачивании.")
+        print("Это могла вызвать как программа, которой автор упаковал мод, так и загрузка.")
+        print("Если ответить «нет» и скачать мод ещё раз, а список файлов с ошибкой останется тем же.")
+        print("- Значит, именно такой архив лежит на mod.io.")
+
+    print("Данные распаковываются, но гарантировать, что они целы, нельзя.")
+    print()
+    print("Если продолжить:")
+    print("- текстуры или модели могут отображаться неверно;")
+    print("- игра может вылетать или не загружать мод.")
+    print()
+    print("После переноса мода в игру проверь его.")
+    print("Если проблема не критична и мод работает корректно, его можно оставить как есть.")
+    print("При этом учитывай, что позже что-то может сломаться.")
+    print("Если мод работает плохо, лучше полностью удалить его из папки игры.")
+    print()
+
+
 def extract_zip(zip_path, extract_root, mod_name=None, name_mode=MODE_NAME_AUTO,
-                zip_was_skipped=False):
+                zip_was_skipped=False, md5_verified=False):
     """Распаковывает ZIP в extract_root.
 
-    Возвращает (path, had_old_warning), либо None, если пользователь
-    отказался переустанавливать существующую папку.
+    Возвращает (path, had_warning, crc_ignored): crc_ignored — сколько файлов
+    с ошибкой CRC пользователь разрешил распаковать. Либо None, если
+    пользователь отказался переустанавливать существующую папку.
     """
-    had_old_warning = False
+    had_warning = False
+    crc_ignored = 0
 
     extract_root.mkdir(parents=True, exist_ok=True)
 
@@ -1684,7 +1909,7 @@ def extract_zip(zip_path, extract_root, mod_name=None, name_mode=MODE_NAME_AUTO,
                 print("Если ты не уверен, что там актуальная версия — выбери «да».")
                 print()
 
-                answer = input("Распаковать заново? (нет/да):\n> ").strip().lower()
+                answer = input("Распаковать заново? (да/нет):\n> ").strip().lower()
 
                 if answer not in ("да", "д", "yes", "y"):
                     return None
@@ -1791,66 +2016,118 @@ def extract_zip(zip_path, extract_root, mod_name=None, name_mode=MODE_NAME_AUTO,
                 if confirmed_delete and final_path.exists() else ""
             )
 
-            try:
-                zf.extractall(tmp_path, members=members)
-            except zipfile.BadZipFile as e:
-                # Bad CRC-32 и подобное: данные внутри архива не сходятся
-                # с его же контрольной суммой. К символам и длине пути
-                # это отношения не имеет.
-                raise RuntimeError(
-                    "Архив повреждён внутри! Данные файла не сходятся "
-                    "с контрольной суммой (CRC).\n"
-                    f"Причина: {e}\n"
-                    "Если при скачивании было «Проверка MD5: OK», файл "
-                    "совпадает с тем, что лежит на mod.io.\n"
-                    "Скорее всего, архив битый у источника. "
-                    "Повторное скачивание не поможет.\n"
-                    "Проверь архив в 7-Zip («Тестировать»): если он тоже "
-                    "ругается, напиши автору мода, чтобы перезалил файл."
-                    + old_note
-                    + "\n\nМожно распаковать вручную, но на свой страх и риск!"
-                ) from e
-            except (EOFError, zlib.error) as e:
-                # EOFError нельзя пропускать как есть: выше по стеку он
-                # означает «ввод прерван» и завершил бы скрипт с неверным
-                # сообщением.
-                raise RuntimeError(
-                    "Архив обрезан или данные сжатия повреждены.\n"
-                    f"Причина: {e}\n"
-                    "Скорее всего, файл битый. Попробуй скачать заново, "
-                    "а если не поможет — напиши автору мода."
-                    + old_note
-                ) from e
-            except NotImplementedError as e:
-                raise RuntimeError(
-                    "Архив использует метод сжатия, который Python "
-                    "не поддерживает.\n"
-                    f"Причина: {e}\n"
-                    "Распакуй его вручную (например, 7-Zip)."
-                    + old_note
-                ) from e
-            except Exception as e:
-                msg = str(e).lower()
+            crc_confirmed = False
 
-                if "encrypted" in msg or "password" in msg:
+            while True:
+                try:
+                    if crc_confirmed:
+                        _extract_without_crc_check(zf, tmp_path, members)
+                    else:
+                        zf.extractall(tmp_path, members=members)
+                    break
+                except zipfile.BadZipFile as e:
+                    # Bad CRC-32 и подобное: данные внутри архива не сходятся
+                    # с его же контрольной суммой. К символам и длине пути
+                    # это отношения не имеет.
+                    crc_names = []
+                    can_skip = _can_skip_crc_check()
+
+                    # Диагностика CRC не требует monkey-patch — её можно
+                    # сделать всегда, а обход распаковки — только если can_skip.
+                    if not crc_confirmed:
+                        crc_names = _find_crc_only_problems(zip_path, real_files)
+
+                    if not crc_names:
+                        # Настоящая порча (или нечем проверить): продолжать нельзя.
+                        raise RuntimeError(
+                            "Архив повреждён внутри! Данные файла не сходятся "
+                            "с контрольной суммой (CRC).\n"
+                            f"Причина: {e}\n"
+                            "Если при скачивании было «Проверка MD5: OK», файл "
+                            "совпадает с тем, что лежит на mod.io.\n"
+                            "Скорее всего, архив битый у источника. "
+                            "Повторное скачивание не поможет.\n"
+                            "Проверь архив в 7-Zip («Тестировать»): если он тоже "
+                            "ругается, напиши автору мода, чтобы перезалил файл."
+                            + old_note
+                            + "\n\nМожно распаковать вручную, но на свой страх и риск!"
+                        ) from e
+
+                    if not can_skip:
+                        # Только CRC, но в этой сборке Python нет _update_crc.
+                        raise RuntimeError(
+                            "В архиве не сходятся контрольные суммы (CRC), "
+                            "но в этой версии Python скрипт не может обойти "
+                            "проверку при распаковке.\n"
+                            f"Причина от zipfile: {e}\n"
+                            "Распакуй архив вручную (например, в 7-Zip) "
+                            "или используй Python, где этот обход доступен."
+                            + old_note
+                        ) from e
+
+                    _show_crc_warning(crc_names, len(real_files), md5_verified)
+
+                    if not _ask_yes_no("Продолжить распаковку?"):
+                        raise ExtractionCancelled("Распаковка отменена пользователем.")
+
+                    print()
+                    print("Распаковываю без проверки CRC...")
+                    crc_confirmed = True
+                    crc_ignored = len(crc_names)
+
+                    # Первая попытка могла частично записать файлы в tmp
+                    # до BadZipFile — убираем остатки перед повторной распаковкой.
+                    for child in list(tmp_path.iterdir()):
+                        try:
+                            if child.is_dir():
+                                shutil.rmtree(child)
+                            else:
+                                child.unlink()
+                        except OSError:
+                            pass
+
+                    continue
+                except (EOFError, zlib.error) as e:
+                    # EOFError нельзя пропускать как есть: выше по стеку он
+                    # означает «ввод прерван» и завершил бы скрипт с неверным
+                    # сообщением.
                     raise RuntimeError(
-                        "Архив зашифрован — распаковать нельзя.\n"
-                        "Такой архив требует пароль, скрипт его не знает."
+                        "Архив обрезан или данные сжатия повреждены.\n"
+                        f"Причина: {e}\n"
+                        "Скорее всего, файл битый. Попробуй скачать заново, "
+                        "а если не поможет — напиши автору мода."
                         + old_note
                     ) from e
-
-                if isinstance(e, OSError):
+                except NotImplementedError as e:
                     raise RuntimeError(
-                        f"Не удалось записать файлы: {e}\n"
-                        "Возможно, имена файлов внутри содержат символы, "
-                        "недопустимые в Windows, путь получился слишком "
-                        "длинным, или не хватает места/прав."
+                        "Архив использует метод сжатия, который Python "
+                        "не поддерживает.\n"
+                        f"Причина: {e}\n"
+                        "Распакуй его вручную (например, 7-Zip)."
                         + old_note
                     ) from e
+                except Exception as e:
+                    msg = str(e).lower()
 
-                raise RuntimeError(
-                    f"Неожиданная ошибка: {e}" + old_note
-                ) from e
+                    if "encrypted" in msg or "password" in msg:
+                        raise RuntimeError(
+                            "Архив зашифрован — распаковать нельзя.\n"
+                            "Такой архив требует пароль, скрипт его не знает."
+                            + old_note
+                        ) from e
+
+                    if isinstance(e, OSError):
+                        raise RuntimeError(
+                            f"Не удалось записать файлы: {e}\n"
+                            "Возможно, имена файлов внутри содержат символы, "
+                            "недопустимые в Windows, путь получился слишком "
+                            "длинным, или не хватает места/прав."
+                            + old_note
+                        ) from e
+
+                    raise RuntimeError(
+                        f"Неожиданная ошибка: {e}" + old_note
+                    ) from e
 
             source = (tmp_path / top_name) if single_folder else tmp_path
 
@@ -1912,13 +2189,13 @@ def extract_zip(zip_path, extract_root, mod_name=None, name_mode=MODE_NAME_AUTO,
                 try:
                     shutil.rmtree(old_path)
                 except OSError as e:
-                    had_old_warning = True
+                    had_warning = True
                     print()
                     print(f"Не удалось удалить старую папку: {old_path}")
                     print(f"Причина: {e}")
                     print("Можешь удалить её вручную.")
 
-    return final_path, had_old_warning
+    return final_path, had_warning, crc_ignored
 
 
 def confirm_delete_with_code():
@@ -2010,6 +2287,11 @@ def record_extract_status(issues, name, status):
         issues.append(f"{name}: операция отменена пользователем — ZIP остался в Downloads")
     elif status == STATUS_NOT_ZIP:
         issues.append(f"{name}: файл не ZIP — распаковка пропущена")
+    elif status == STATUS_EXTRACTED_CRC:
+        issues.append(
+            f"{name}: установлено, но в архиве были ошибки CRC — "
+            "проверь мод в игре"
+        )
     elif status == STATUS_EXTRACTED_WITH_WARNINGS:
         issues.append(
             f"{name}: установлено, но старая версия (.old) не удалилась — "
@@ -2059,6 +2341,9 @@ def download_mod(mod, api_key, output_dir, file_info, mod_name=None,
 
     extract_status = None
 
+    filehash = file_info.get("filehash")
+    md5_verified = isinstance(filehash, dict) and bool(filehash.get("md5"))
+
     if EXTRACT_DIR is not None:
         print()
         if not zipfile.is_zipfile(zip_path):
@@ -2071,16 +2356,19 @@ def download_mod(mod, api_key, output_dir, file_info, mod_name=None,
                     mod_name=mod_name,
                     name_mode=name_mode,
                     zip_was_skipped=was_skipped,
+                    md5_verified=md5_verified,
                 )
 
                 if result is None:
                     print("Распаковка пропущена (папка уже распакована).")
                     extract_status = STATUS_ALREADY
                 else:
-                    path, had_warning = result
+                    path, had_warning, crc_ignored = result
                     print(f"Распаковано в: {path}")
 
-                    if had_warning:
+                    if crc_ignored:
+                        extract_status = STATUS_EXTRACTED_CRC
+                    elif had_warning:
                         extract_status = STATUS_EXTRACTED_WITH_WARNINGS
                     else:
                         extract_status = STATUS_EXTRACTED
@@ -2427,6 +2715,7 @@ def process_one_url(api_key, file_mode, name_mode, initial_url=None):
     if EXTRACT_DIR is not None and status not in (
         STATUS_EXTRACTED,
         STATUS_EXTRACTED_WITH_WARNINGS,
+        STATUS_EXTRACTED_CRC,
         STATUS_ALREADY,
     ):
         print()
