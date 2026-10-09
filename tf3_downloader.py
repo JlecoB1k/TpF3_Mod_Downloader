@@ -1,3 +1,4 @@
+import configparser
 import getpass
 import hashlib
 import os
@@ -34,7 +35,7 @@ except ModuleNotFoundError:
     sys.exit(1)
 
 
-VERSION = "0.9.45-BETA"
+VERSION = "1.0.0"
 
 GAME_ID = 10640
 API_BASE = f"https://g-{GAME_ID}.modapi.io/v1"
@@ -55,6 +56,10 @@ MAX_ZIP_MEMBERS_WARN = 8_000
 DEPENDENCIES_PAGE_LIMIT = 100
 MAX_DEPENDENCIES = 25
 
+# Сколько файлов мода максимум просматриваем при автопоиске платформы
+# (защита от вечного цикла пагинации).
+MAX_FILES_SCAN = 2_000
+
 KNOWN_CDN_SUFFIXES = (
     ".mod.io",
     ".modapi.io",
@@ -67,6 +72,10 @@ RETRYABLE_API_STATUSES = (429, 500, 502, 503, 504)
 # У мода могут быть отдельные файлы под разные платформы (Windows, консоли, Linux).
 TARGET_PLATFORM = "windows"
 
+# Консольные платформы mod.io. ПК-группа (windows/linux/all) на mod.io
+# для этих игр общая, поэтому в предупреждениях отделяем именно консоли.
+CONSOLE_PLATFORMS = {"PS4", "PS5", "XBOXONE", "XBOXSERIES", "SWITCH"}
+
 # API-ключ mod.io: по документации — 32 символа.
 API_KEY_LENGTH = 32
 MAX_KEY_ATTEMPTS = 3
@@ -76,15 +85,286 @@ class InvalidApiKeyError(RuntimeError):
     """mod.io не принял API key (HTTP 401)."""
 
 # ---------- Настройки распаковки ----------
-EXTRACT_DIR = Path(r"C:\Games\Буфер TpF3")
-KEEP_ZIP = True
+# Значения по умолчанию. Реальные настройки читаются из config.ini
+# рядом со скриптом (см. раздел «config.ini»). Если конфига нет или
+# он не читается, работают эти значения.
+DEFAULT_EXTRACT_DIR = Path(r"C:\Games\Буфер TpF3")
+DEFAULT_KEEP_ZIP = True
+DEFAULT_CRC_POLICY = "ask"
+
+# Рабочие значения: main() перезадаёт их после чтения config.ini.
+EXTRACT_DIR = DEFAULT_EXTRACT_DIR
+KEEP_ZIP = DEFAULT_KEEP_ZIP
+CRC_POLICY = DEFAULT_CRC_POLICY  # "ask" | "stop"
+DOWNLOADS_DIR = None  # None — автопоиск папки «Загрузки»
 # ------------------------------------------
+
+# ---------- config.ini ----------
+
+CONFIG_FILE_NAME = "config.ini"
+
+YES_VALUES = ("да", "yes", "true", "1", "on")
+NO_VALUES = ("нет", "no", "false", "0", "off")
+CRC_ASK_VALUES = ("спрашивать", "ask")
+CRC_STOP_VALUES = ("остановить", "stop")
+
+KNOWN_CONFIG_KEYS = {
+    "paths": {"extract_dir", "downloads_dir"},
+    "behavior": {"keep_zip", "crc_policy"},
+}
+
+
+def _strip_quotes(value):
+    """Снимает одну пару симметричных кавычек вокруг значения."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def _norm_setting(value):
+    """Нормализует значение настройки для сравнения с вариантами."""
+    return _strip_quotes(str(value)).strip().lower()
+
+
+def _match_setting(raw, key, variants, problems, fallback_display):
+    """Сопоставляет значение настройки со списком вариантов.
+
+    variants — пары (синонимы, результат); каноничное написание —
+    первый синоним. Если значение не распознано, пишет предупреждение
+    и возвращает None (значит, брать значение по умолчанию)."""
+    for synonyms, result in variants:
+        if raw in synonyms:
+            return result
+
+    allowed = ", ".join(synonyms[0] for synonyms, _ in variants)
+    problems.append(
+        f"Настройка {key}: значение «{raw}» не распознано. "
+        f"Допустимо: {allowed}. Использую «{fallback_display}»."
+    )
+    return None
+
+
+def _read_config_text(config_path, problems):
+    """Читает config.ini как текст. None — прочитать не удалось.
+
+    Файл поставляется в UTF-8, но если пользователь пересохранил его
+    старым редактором в cp1251 — пробуем и её, а не падаем."""
+    try:
+        raw = config_path.read_bytes()
+    except OSError as e:
+        problems.append(
+            f"config.ini не удалось прочитать: {e}. "
+            "Использую значения по умолчанию."
+        )
+        return None
+
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        problems.append(
+            "config.ini сохранён в UTF-16. "
+            "Пересохрани его в UTF-8 и запусти скрипт снова. "
+            "Пока использую значения по умолчанию."
+        )
+        return None
+
+    for encoding in ("utf-8-sig", "cp1251"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+    problems.append(
+        "config.ini не удалось прочитать ни как UTF-8, ни как cp1251. "
+        "Пересохрани его в UTF-8. Пока использую значения по умолчанию."
+    )
+    return None
+
+
+def _parse_config_text(text, problems):
+    """Разбирает текст config.ini. None — файл битый целиком."""
+    parser = configparser.ConfigParser(
+        interpolation=None,
+        # Комментарий в конце строки — только если перед ним пробел:
+        # «C:\Mods  # моя папка» → «C:\Mods», а «C:\Mods#1» остаётся как есть.
+        inline_comment_prefixes=("#", ";"),
+    )
+
+    try:
+        parser.read_string(text)
+    except configparser.Error as e:
+        problems.append(
+            f"config.ini не удалось разобрать: {e}. "
+            "Пока использую значения по умолчанию."
+        )
+        return None
+
+    return parser
+
+
+def _warn_unknown_config_keys(parser, problems):
+    """Предупреждает о секциях и ключах, которых не знаем.
+
+    Ловит опечатки вроде keepzip = нет, которые иначе прошли бы молча."""
+    for section in parser.sections():
+        known = KNOWN_CONFIG_KEYS.get(section)
+
+        if known is None:
+            problems.append(
+                f"config.ini: неизвестная секция [{section}] — пропускаю её."
+            )
+            continue
+
+        for key in parser.options(section):
+            if key not in known:
+                allowed = ", ".join(sorted(known))
+                problems.append(
+                    f"config.ini: неизвестная настройка \"{key}\" в [{section}]. "
+                    f"Допустимо здесь: {allowed}."
+                )
+
+
+def _path_from_config(raw_value, problems, key):
+    """Path из значения настройки. None — путь не годится."""
+    value = _strip_quotes(str(raw_value)).strip()
+
+    if not value:
+        return None
+
+    candidate = Path(value)
+
+    if not candidate.is_absolute():
+        problems.append(
+            f"Настройка {key}: \"{value}\" — не полный путь. "
+            "Укажи диск, например C:\\Моды."
+        )
+        return None
+
+    return candidate
+
+
+def load_config():
+    """Читает config.ini рядом со скриптом.
+
+    Возвращает (extract_dir, downloads_dir, keep_zip, crc_policy, problems):
+      extract_dir   — Path или None (пусто в конфиге = только скачивать);
+      downloads_dir — Path или None (пусто или папки нет = «Загрузки»);
+      keep_zip      — bool;
+      crc_policy    — "ask" или "stop";
+      problems      — список строк-замечаний для показа пользователю.
+
+    Скрипт из-за конфига не падает никогда: при любой проблеме
+    возвращаются подходящие значения по умолчанию."""
+    problems = []
+    config_path = Path(__file__).resolve().parent / CONFIG_FILE_NAME
+
+    extract_dir = DEFAULT_EXTRACT_DIR
+    downloads_dir = None
+    keep_zip = DEFAULT_KEEP_ZIP
+    crc_policy = DEFAULT_CRC_POLICY
+
+    if not config_path.is_file():
+        problems.append(
+            "config.ini не найден рядом со скриптом — "
+            "использую значения по умолчанию."
+        )
+        return extract_dir, downloads_dir, keep_zip, crc_policy, problems
+
+    text = _read_config_text(config_path, problems)
+    if text is None:
+        return extract_dir, downloads_dir, keep_zip, crc_policy, problems
+
+    parser = _parse_config_text(text, problems)
+    if parser is None:
+        return extract_dir, downloads_dir, keep_zip, crc_policy, problems
+
+    _warn_unknown_config_keys(parser, problems)
+
+    for section in KNOWN_CONFIG_KEYS:
+        if not parser.has_section(section):
+            problems.append(
+                f"config.ini: секция [{section}] не найдена — "
+                "для её настроек использую значения по умолчанию."
+            )
+
+    # ---- extract_dir ----
+    if parser.has_option("paths", "extract_dir"):
+        raw_value = parser.get("paths", "extract_dir")
+
+        if not _norm_setting(raw_value):
+            # Пусто — особый смысл: вообще не распаковывать.
+            extract_dir = None
+        else:
+            candidate = _path_from_config(raw_value, problems, "extract_dir")
+
+            if candidate is not None:
+                extract_dir = candidate
+            else:
+                problems.append(
+                    f"Использую папку по умолчанию: {DEFAULT_EXTRACT_DIR}."
+                )
+
+    # ---- downloads_dir ----
+    if parser.has_option("paths", "downloads_dir"):
+        raw_value = parser.get("paths", "downloads_dir")
+
+        if _norm_setting(raw_value):
+            candidate = _path_from_config(raw_value, problems, "downloads_dir")
+
+            if candidate is not None:
+                if candidate.is_dir():
+                    downloads_dir = candidate
+                else:
+                    problems.append(
+                        f"Настройка downloads_dir: папка \"{candidate}\" "
+                        "не найдена — сохраняю ZIP в «Загрузки»."
+                    )
+
+    # ---- keep_zip ----
+    if parser.has_option("behavior", "keep_zip"):
+        raw = _norm_setting(parser.get("behavior", "keep_zip"))
+        result = _match_setting(
+            raw, "keep_zip",
+            ((YES_VALUES, True), (NO_VALUES, False)),
+            problems, "да",
+        )
+
+        if result is not None:
+            keep_zip = result
+
+    # ---- crc_policy ----
+    if parser.has_option("behavior", "crc_policy"):
+        raw = _norm_setting(parser.get("behavior", "crc_policy"))
+        result = _match_setting(
+            raw, "crc_policy",
+            ((CRC_ASK_VALUES, "ask"), (CRC_STOP_VALUES, "stop")),
+            problems, "спрашивать",
+        )
+
+        if result is not None:
+            crc_policy = result
+
+    return extract_dir, downloads_dir, keep_zip, crc_policy, problems
+
+
+def print_config_problems(problems):
+    """Показывает замечания по config.ini, если они есть."""
+    if not problems:
+        return
+
+    print()
+    print("Замечания по config.ini:")
+    for line in problems:
+        print(f"- {line}")
+    print()
+
+# ---------------------------------
+
 
 # ---------- Статусы распаковки ----------
 STATUS_EXTRACTED = "extracted"
 STATUS_EXTRACTED_WITH_WARNINGS = "extracted_warnings"
 STATUS_ALREADY = "already"
 STATUS_CANCELLED = "cancelled"
+STATUS_CRC_STOPPED = "crc_stopped"
 STATUS_FAILED = "failed"
 STATUS_NOT_ZIP = "not_zip"
 STATUS_EXTRACTED_CRC = "extracted_crc"
@@ -125,6 +405,10 @@ _SESSION.headers.update({
 
 class ExtractionCancelled(Exception):
     """Пользователь отказался от распаковки."""
+
+
+class CrcPolicyStop(ExtractionCancelled):
+    """Распаковка остановлена настройкой crc_policy = остановить."""
 
 
 class IncompleteDownload(Exception):
@@ -324,6 +608,9 @@ def host_is_known_cdn(url):
 
 def get_downloads_dir():
     """Возвращает путь к папке загрузок."""
+    if DOWNLOADS_DIR is not None:
+        return DOWNLOADS_DIR
+
     home = Path.home()
 
     for name in ("Downloads", "Загрузки"):
@@ -386,13 +673,18 @@ def print_progress(text, width=80):
     print(f"\r{text:<{width}}", end="", flush=True)
 
 
-def _print_download_progress(total, filesize):
-    """Строка прогресса скачивания: «Скачано: N байт (X%)»."""
+def _print_download_progress(total, filesize, speed=None):
+    """Строка прогресса скачивания: «Скачано: N байт (X%) · 8.3 МБ/с»."""
     if filesize:
         percent = min(100, total * 100 // filesize)
-        print_progress(f"Скачано: {total:,} байт ({percent}%)")
+        line = f"Скачано: {total:,} байт ({percent}%)"
     else:
-        print_progress(f"Скачано: {total:,} байт")
+        line = f"Скачано: {total:,} байт"
+
+    if speed is not None:
+        line += f" · {format_size(speed)}/с"
+
+    print_progress(line)
 
 
 def _print_retry_message(error, attempt):
@@ -457,7 +749,11 @@ def _is_junk_member(filename):
 
 
 def warn_about_old_folders(extract_dir):
-    """Ищет .old-папки и остатки tmpXXXX в буфере."""
+    """Ищет .old-папки; tmp-остатки подчищает тихо и сообщает факт.
+
+    .old — откат пользователя, их не трогаем. tmp-папки появляются
+    только при жёстком убийстве процесса посреди распаковки
+    (Ctrl+C их убирает сам), пользовательских данных там нет."""
     if extract_dir is None or not extract_dir.exists():
         return
 
@@ -473,32 +769,52 @@ def warn_about_old_folders(extract_dir):
         if p.is_dir() and tmp_pattern.match(p.name)
     )
 
-    if not leftover_old and not leftover_tmp:
+    cleaned_tmp = []
+    failed_tmp = []
+
+    for p in leftover_tmp:
+        try:
+            shutil.rmtree(p)
+            cleaned_tmp.append(p.name)
+        except OSError:
+            failed_tmp.append(p)
+
+    if not leftover_old and not cleaned_tmp and not failed_tmp:
         return
 
-    print("=" * 60)
-    print("Остатки от прошлых запусков")
-    print("=" * 60)
+    if cleaned_tmp:
+        print()
+        print("Подчищены временные папки от прерванной распаковки:")
+        for name in cleaned_tmp:
+            print(f"  {name}")
 
-    if leftover_old:
+    if leftover_old or failed_tmp:
         print()
-        print("Старые версии модов (не удалось удалить после замены):")
-        for p in leftover_old:
-            print(f"  {p}")
+        print("=" * 60)
+        print("Остатки от прошлых запусков")
+        print("=" * 60)
         print()
-        print("Если не нужно — удали вручную.")
-        print("Если нужно восстановить — переименуй, убрав \".old\" из имени.")
 
-    if leftover_tmp:
-        print()
-        print("Временные папки (процесс был завершён жёстко):")
-        for p in leftover_tmp:
-            print(f"  {p}")
-        print()
-        print("Это недоделанная распаковка, безопасно удалить вручную.")
+        if leftover_old:
+            print("Старые версии модов (не удалось удалить после замены):")
+            for p in leftover_old:
+                print(f"  {p}")
+            print()
+            print("Если не нужно — удали вручную.")
+            print("Если нужно восстановить — переименуй, убрав \".old\" из имени.")
 
-    print("=" * 60)
-    print()
+        if failed_tmp:
+            print()
+            print("Временные папки (процесс был завершён жёстко) ")
+            print("удалить не удалось, возможно, они чем-то заняты:")
+            for p in failed_tmp:
+                print(f"  {p}")
+            print("Это недоделанная распаковка, удали вручную.")
+
+        print("=" * 60)
+
+    if cleaned_tmp or leftover_old or failed_tmp:
+        print()
 
 
 # ---------- Санитайз и валидация имени папки ----------
@@ -526,6 +842,10 @@ def sanitize_zip_filename(name):
         cleaned = f"{stem}{dot}{ext}" if stem else f"mod{dot}{ext}"
     else:
         cleaned = cleaned.rstrip(". ")
+
+    # "mod.zip " — расширение приходит с хвостовым пробелом; Windows
+    # не любит точки/пробелы в конце имени.
+    cleaned = cleaned.rstrip(". ")
 
     if not cleaned:
         return "mod.zip"
@@ -718,7 +1038,8 @@ def check_extract_dir(extract_dir):
             f"Путь к буферу распаковки слишком длинный "
             f"({len(path_str)} символов, максимум {MAX_EXTRACT_DIR_LEN}).\n"
             "Windows может не справиться с путями к файлам внутри мода.\n"
-            "Сократи EXTRACT_DIR или перенеси буфер ближе к корню диска."
+            "Сократи extract_dir в config.ini или перенеси буфер "
+            "ближе к корню диска."
         )
 
     try:
@@ -727,7 +1048,8 @@ def check_extract_dir(extract_dir):
         raise RuntimeError(
             f"Не удалось создать/открыть папку распаковки:\n"
             f"  {extract_dir}\n"
-            f"Причина: {e}"
+            f"Причина: {e}\n"
+            "Проверь настройку extract_dir в config.ini."
         ) from e
 
 
@@ -932,10 +1254,29 @@ def _file_fits_target(item):
         return True
 
     for name, status in entries:
-        if name in (TARGET_PLATFORM.upper(), "ALL") and status != 2:  # 2 = DENIED
-            return True
+        # safe_int: если mod.io вернёт статус строкой ("2"), сравнение
+        # "2" != 2 ошибочно сочло бы отклонённую платформу разрешённой.
+        if name in (TARGET_PLATFORM.upper(), "ALL") and safe_int(status) != 2:
+            return True  # 2 = DENIED
 
     return False
+
+
+def _is_console_only_file(item):
+    """True — файл помечен платформами только консольного типа.
+
+    Пустой список платформ или нераспознанные имена консолью НЕ считаем:
+    лучше нейтральное предупреждение, чем ложное «только для консолей»."""
+    entries = _platform_entries(item)
+
+    if not entries:
+        return False
+
+    for name, _ in entries:
+        if name not in CONSOLE_PLATFORMS:
+            return False
+
+    return True
 
 
 def _live_file_id_for_target(mod):
@@ -968,17 +1309,50 @@ def _live_file_id_for_target(mod):
 
 
 def _find_target_file(mod_id, api_key):
-    """Ищет среди файлов мода самый свежий файл для нашей платформы."""
-    data = api_get(
-        f"/games/{GAME_ID}/mods/{mod_id}/files",
-        api_key,
-        {"_limit": 100},
-    )
+    """Ищет среди файлов мода самый свежий файл для нашей платформы.
 
-    files = data.get("data") if isinstance(data, dict) else None
+    Список файлов читаем постранично: если у мода больше 100 файлов,
+    подходящая версия может не попасть в первую страницу."""
+    files = []
+    offset = 0
+    total_seen = None
 
-    if not isinstance(files, list):
-        return None
+    while True:
+        data = api_get(
+            f"/games/{GAME_ID}/mods/{mod_id}/files",
+            api_key,
+            {"_limit": 100, "_offset": offset},
+        )
+
+        if not isinstance(data, dict):
+            break
+
+        page = data.get("data")
+        if not isinstance(page, list) or not page:
+            break
+
+        files.extend(page)
+        total_seen = safe_non_negative_int(data.get("result_total"))
+
+        if total_seen is not None and len(files) >= total_seen:
+            break
+
+        if len(page) < 100 or len(files) >= MAX_FILES_SCAN:
+            break
+
+        offset += len(page)
+
+    if total_seen is not None and len(files) < total_seen:
+        print(
+            f"ВНИМАНИЕ: у мода {total_seen} файлов, просмотрены не все "
+            f"({len(files)}) — подходящая версия могла остаться "
+            "вне просмотра."
+        )
+    elif total_seen is None and len(files) >= MAX_FILES_SCAN:
+        print(
+            f"ВНИМАНИЕ: просмотр остановлен на лимите {MAX_FILES_SCAN} "
+            "файлов — подходящая версия могла остаться вне просмотра."
+        )
 
     best = None
 
@@ -1015,7 +1389,14 @@ def resolve_file_info(mod, mod_id, api_key, ask=True):
     """Выбирает файл мода для нашей платформы. Возвращает (file_id, file_info).
 
     Если подходящего файла нет и пользователь отказался скачивать
-    «не тот» файл, возвращает (None, None)."""
+    «не тот» файл, возвращает (None, None).
+
+    ask=False — выбор без вопроса. Сейчас основным кодом не вызывается:
+    обновление протухшей ссылки идёт через fetch_file_info для того же
+    файла. Параметр оставлен для неинтерактивных сценариев — прежде
+    всего пакетного режима (несколько файлов за запуск). Там
+    «предыдущего одобрения» пользователя нет, и политику выбора файла
+    под платформу надо будет задать отдельно и осознанно."""
     file_id = get_current_file_id(mod, api_key)
     file_info = fetch_file_info(mod_id, file_id, api_key)
 
@@ -1039,7 +1420,24 @@ def resolve_file_info(mod, mod_id, api_key, ask=True):
 
     print(f"Файл для {TARGET_PLATFORM.capitalize()} не найден.")
 
-    if ask and not _ask_yes_no("Всё равно скачать текущий файл?"):
+    console_only = _is_console_only_file(file_info)
+
+    if console_only:
+        print()
+        print(
+            "Внимание! Найденный файл помечен mod.io, как работающий "
+            f"только на консолях ({_platforms_text(file_info)})."
+        )
+        print("На Windows он работать не будет.")
+        print("Скрипт за работу этого файла не отвечает.")
+
+    question = (
+        "Всё равно скачать файл для консоли?"
+        if console_only
+        else "Всё равно скачать текущий файл?"
+    )
+
+    if ask and not _ask_yes_no(question):
         return None, None
 
     return file_id, file_info
@@ -1109,6 +1507,10 @@ def fetch_dependencies_once(mod_id, api_key):
             api_key,
             {"_limit": DEPENDENCIES_PAGE_LIMIT},
         )
+    except InvalidApiKeyError:
+        # Ключ перестал работать — это не «проблема зависимостей»,
+        # молча продолжать без них нельзя.
+        raise
     except Exception as e:
         print(f"Не удалось получить список зависимостей: {mask_key(e, api_key)}")
         return [], FETCH_ERROR
@@ -1349,6 +1751,21 @@ def download_zip(file_info, output_dir, fallback_name, api_key=None):
         )
 
     print("-" * 60)
+
+    # Проверка места ДО скачивания: чтобы не тратить трафик на файл,
+    # который всё равно не поместится.
+    if filesize is not None:
+        free_space = shutil.disk_usage(output_dir).free
+
+        if filesize > free_space:
+            raise RuntimeError(
+                f"Недостаточно места для скачивания:\n"
+                f"  нужно:     {format_size(filesize)}\n"
+                f"  свободно:  {format_size(free_space)}\n"
+                f"Папка: {output_dir}\n"
+                "Освободи место и запусти скрипт снова."
+            )
+
     print()
     print("Временная ссылка получена:")
     print(mask_url(binary_url, api_key))
@@ -1434,6 +1851,10 @@ def download_zip(file_info, output_dir, fallback_name, api_key=None):
             try:
                 if attempt == 1 and md5_attempt == 1:
                     print_progress("Подключаюсь к серверу загрузки...")
+                elif attempt == 1:
+                    print_progress(
+                        "Подключаюсь к серверу загрузки (повторное скачивание)..."
+                    )
                 else:
                     print_progress(
                         "Подключаюсь к серверу загрузки "
@@ -1492,6 +1913,10 @@ def download_zip(file_info, output_dir, fallback_name, api_key=None):
                     print_progress("Соединение установлено, жду данные...")
 
                     last_update = 0.0
+                    # Скользящее окно скорости: замеры (время, байты) за ~3 сек.
+                    speed_window = deque()
+                    data_start = None
+
                     with open(tmp_path, "wb") as f:
                         for chunk in response.iter_content(chunk_size=64 * 1024):
                             if not chunk:
@@ -1502,9 +1927,39 @@ def download_zip(file_info, output_dir, fallback_name, api_key=None):
                             total += len(chunk)
 
                             now = time.monotonic()
+
+                            if data_start is None:
+                                data_start = now
+
                             if now - last_update >= 0.2:
                                 last_update = now
-                                _print_download_progress(total, filesize)
+                                speed_window.append((now, total))
+
+                                # Окно ~3 сек, но не меньше двух точек.
+                                while (
+                                    len(speed_window) > 2
+                                    and now - speed_window[0][0] > 3.0
+                                ):
+                                    speed_window.popleft()
+
+                                speed = None
+                                if (
+                                    now - data_start >= 1.0
+                                    and len(speed_window) >= 2
+                                ):
+                                    dt = (
+                                        speed_window[-1][0]
+                                        - speed_window[0][0]
+                                    )
+                                    if dt > 0:
+                                        speed = (
+                                            speed_window[-1][1]
+                                            - speed_window[0][1]
+                                        ) / dt
+
+                                _print_download_progress(total, filesize, speed)
+
+                    _print_download_progress(total, filesize)
 
                     _print_download_progress(total, filesize)
 
@@ -1755,6 +2210,28 @@ def _find_crc_only_problems(zip_path, files):
     return crc_names
 
 
+def _crc_stop_text(crc_names, total_files):
+    """Короткий текст остановки при crc_policy = остановить."""
+    lines = [
+        "=" * 60,
+        "Распаковка остановлена: в архиве есть ошибки CRC.",
+        "=" * 60,
+        f"Файлов с ошибкой CRC: {len(crc_names)} из {total_files}",
+    ]
+    lines += [f"- {name}" for name in crc_names[:CRC_LIST_LIMIT]]
+
+    rest = len(crc_names) - CRC_LIST_LIMIT
+    if rest > 0:
+        lines.append(f"…и ещё {rest}")
+
+    lines += [
+        "",
+        "Мод не распакован.",
+        "Чтобы спрашивать вместо остановки, поставь в config.ini: crc_policy = спрашивать",
+    ]
+    return "\n".join(lines)
+
+
 def _show_crc_warning(crc_names, total_files, md5_verified):
     """Окно с предупреждением об ошибках CRC в архиве."""
     print()
@@ -1899,7 +2376,10 @@ def extract_zip(zip_path, extract_root, mod_name=None, name_mode=MODE_NAME_AUTO,
             if not final_path.exists():
                 break
 
-            if zip_was_skipped:
+            if zip_was_skipped and final_path.is_dir():
+                # По этому пути может лежать файл (переименовали вручную
+                # и т.п.) — тогда уходим в обычный диалог, который умеет
+                # объяснять «здесь файл, а не папка».
                 zip_was_skipped = False
 
                 print()
@@ -1964,7 +2444,8 @@ def extract_zip(zip_path, extract_root, mod_name=None, name_mode=MODE_NAME_AUTO,
             print("ВНИМАНИЕ: внутри архива есть файлы с длинными путями.")
             print(f"Самый длинный путь после распаковки: ~{longest} символов.")
             print("Windows может отказать при распаковке (лимит 260 символов).")
-            print("Если распаковка упадёт — сократи EXTRACT_DIR или имя папки.")
+            print("Если распаковка упадёт — сократи extract_dir в config.ini")
+            print("или имя папки.")
             print()
 
         total_uncompressed = sum(m.file_size for m in members)
@@ -2064,6 +2545,11 @@ def extract_zip(zip_path, extract_root, mod_name=None, name_mode=MODE_NAME_AUTO,
                             "или используй Python, где этот обход доступен."
                             + old_note
                         ) from e
+
+                    if CRC_POLICY == "stop":
+                        raise CrcPolicyStop(
+                            _crc_stop_text(crc_names, len(real_files))
+                        )
 
                     _show_crc_warning(crc_names, len(real_files), md5_verified)
 
@@ -2285,6 +2771,8 @@ def record_extract_status(issues, name, status):
         issues.append(f"{name}: не удалось распаковать — ZIP остался в Downloads")
     elif status == STATUS_CANCELLED:
         issues.append(f"{name}: операция отменена пользователем — ZIP остался в Downloads")
+    elif status == STATUS_CRC_STOPPED:
+        issues.append(f"{name}: не распаковано из-за ошибок CRC (crc_policy = остановить)")
     elif status == STATUS_NOT_ZIP:
         issues.append(f"{name}: файл не ZIP — распаковка пропущена")
     elif status == STATUS_EXTRACTED_CRC:
@@ -2333,11 +2821,29 @@ def download_mod(mod, api_key, output_dir, file_info, mod_name=None,
 
             print()
             print(f"Временная ссылка на файл больше не работает ({e}).")
-            print("Получаю свежую ссылку и пробую ещё раз...")
+            print("Получаю свежую ссылку на тот же файл...")
 
-            file_id, file_info = resolve_file_info(
-                mod, mod_id, api_key, ask=False
-            )
+            # Обновляем ссылку для УТВЕРЖДЁННОГО файла, а не выбираем
+            # файл заново: повторный выбор мог бы молча привести к
+            # другому файлу (автор успел сменить live-файл или выложил
+            # windows-версию). Выбор — всегда в resolve_file_info.
+            file_id = safe_non_negative_int(file_info.get("id"))
+
+            if file_id is None:
+                raise RuntimeError(
+                    "Не удалось обновить ссылку: mod.io не вернул id файла.\n"
+                    "Запусти скрипт заново."
+                )
+
+            try:
+                file_info = fetch_file_info(mod_id, file_id, api_key)
+            except Exception as fetch_error:
+                raise RuntimeError(
+                    "Автор удалил или заменил файл.\n"
+                    "Проверь наличие мода и файла на странице, "
+                    "либо запусти скрипт заново.\n"
+                    f"Причина: {mask_key(fetch_error, api_key)}"
+                ) from fetch_error
 
     extract_status = None
 
@@ -2387,7 +2893,10 @@ def download_mod(mod, api_key, output_dir, file_info, mod_name=None,
             except ExtractionCancelled as e:
                 print(f"{e}")
                 print(f"ZIP остался здесь: {zip_path}")
-                extract_status = STATUS_CANCELLED
+                if isinstance(e, CrcPolicyStop):
+                    extract_status = STATUS_CRC_STOPPED
+                else:
+                    extract_status = STATUS_CANCELLED
             except Exception as e:
                 print()
                 print("Не удалось распаковать:")
@@ -2430,7 +2939,15 @@ def process_dependencies(dependencies, api_key, downloads, name_mode, issues):
                 mod_name=dep_display_name, name_mode=name_mode,
             )
             record_extract_status(issues, dep_display_name, dep_status)
+
+            if _is_console_only_file(dep_file_info):
+                issues.append(
+                    f"{dep_display_name}: файл для консоли — "
+                    "на ПК работать не будет."
+                )
         except EOFError:
+            raise
+        except InvalidApiKeyError:
             raise
         except Exception as e:
             print(f"Не удалось скачать зависимость: {mask_key(e, api_key)}")
@@ -2599,6 +3116,7 @@ def process_one_url(api_key, file_mode, name_mode, initial_url=None):
     file_id, file_info = resolve_file_info(mod, mod_id, api_key)
 
     if file_info is None:
+        print("Возврат к вводу ссылки.")
         return "retry_url"
 
     print(f"File ID  : {file_id}")
@@ -2700,10 +3218,14 @@ def process_one_url(api_key, file_mode, name_mode, initial_url=None):
         print("Зависимости не скачиваю — без основного мода они не нужны.")
         return "exit"
 
-    if status == STATUS_CANCELLED:
+    if status in (STATUS_CANCELLED, STATUS_CRC_STOPPED):
         print()
         print("=" * 60)
-        if zip_path is not None:
+        if zip_path is not None and status == STATUS_CRC_STOPPED:
+            print("ZIP основного мода скачан, но распаковка остановлена из-за ошибок CRC.")
+            print("Зависимости не скачиваю — без установленного мода")
+            print("они не имеют смысла.")
+        elif zip_path is not None:
             print("ZIP основного мода скачан, но распаковка отменена.")
             print("Зависимости не скачиваю — без установленного мода")
             print("они не имеют смысла.")
@@ -2723,6 +3245,11 @@ def process_one_url(api_key, file_mode, name_mode, initial_url=None):
         print("Основной мод не установлен — зависимости не скачиваю.")
         print("=" * 60)
         return "warn"
+
+    if _is_console_only_file(file_info):
+        issues.append(
+            f"{mod_name}: файл для консоли — на ПК работать не будет."
+        )
 
     failed = []
 
@@ -2770,6 +3297,17 @@ def main():
     print("=" * 60)
     print(f"Transport Fever 3 — Mod Downloader v{VERSION} by JlecoB1k")
     print("=" * 60)
+
+    global EXTRACT_DIR, DOWNLOADS_DIR, KEEP_ZIP, CRC_POLICY
+    (
+        EXTRACT_DIR,
+        DOWNLOADS_DIR,
+        KEEP_ZIP,
+        CRC_POLICY,
+        config_problems,
+    ) = load_config()
+
+    print_config_problems(config_problems)
     print()
 
     api_key = ""
