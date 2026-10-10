@@ -35,7 +35,7 @@ except ModuleNotFoundError:
     sys.exit(1)
 
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 GAME_ID = 10640
 API_BASE = f"https://g-{GAME_ID}.modapi.io/v1"
@@ -158,9 +158,13 @@ def _read_config_text(config_path, problems):
         )
         return None
 
-    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+    if (
+        raw.startswith(b"\xff\xfe")
+        or raw.startswith(b"\xfe\xff")
+        or raw.startswith(b"\x00\x00\xfe\xff")
+    ):
         problems.append(
-            "config.ini сохранён в UTF-16. "
+            "config.ini сохранён в UTF-16/UTF-32. "
             "Пересохрани его в UTF-8 и запусти скрипт снова. "
             "Пока использую значения по умолчанию."
         )
@@ -200,12 +204,27 @@ def _parse_config_text(text, problems):
     return parser
 
 
+def _find_config_section(parser, name):
+    """Имя секции в parser без учёта регистра. None — секции нет.
+
+    configparser различает регистр секций ([Paths] != [paths]),
+    а пользователь об этом знать не должен."""
+    for section in parser.sections():
+        if section.lower() == name:
+            return section
+    return None
+
+
 def _warn_unknown_config_keys(parser, problems):
     """Предупреждает о секциях и ключах, которых не знаем.
 
     Ловит опечатки вроде keepzip = нет, которые иначе прошли бы молча."""
+    known_lower = {
+        section.lower(): keys for section, keys in KNOWN_CONFIG_KEYS.items()
+    }
+
     for section in parser.sections():
-        known = KNOWN_CONFIG_KEYS.get(section)
+        known = known_lower.get(section.lower())
 
         if known is None:
             problems.append(
@@ -279,15 +298,18 @@ def load_config():
     _warn_unknown_config_keys(parser, problems)
 
     for section in KNOWN_CONFIG_KEYS:
-        if not parser.has_section(section):
+        if _find_config_section(parser, section) is None:
             problems.append(
                 f"config.ini: секция [{section}] не найдена — "
                 "для её настроек использую значения по умолчанию."
             )
 
+    paths_section = _find_config_section(parser, "paths")
+    behavior_section = _find_config_section(parser, "behavior")
+
     # ---- extract_dir ----
-    if parser.has_option("paths", "extract_dir"):
-        raw_value = parser.get("paths", "extract_dir")
+    if paths_section and parser.has_option(paths_section, "extract_dir"):
+        raw_value = parser.get(paths_section, "extract_dir")
 
         if not _norm_setting(raw_value):
             # Пусто — особый смысл: вообще не распаковывать.
@@ -303,8 +325,8 @@ def load_config():
                 )
 
     # ---- downloads_dir ----
-    if parser.has_option("paths", "downloads_dir"):
-        raw_value = parser.get("paths", "downloads_dir")
+    if paths_section and parser.has_option(paths_section, "downloads_dir"):
+        raw_value = parser.get(paths_section, "downloads_dir")
 
         if _norm_setting(raw_value):
             candidate = _path_from_config(raw_value, problems, "downloads_dir")
@@ -319,8 +341,8 @@ def load_config():
                     )
 
     # ---- keep_zip ----
-    if parser.has_option("behavior", "keep_zip"):
-        raw = _norm_setting(parser.get("behavior", "keep_zip"))
+    if behavior_section and parser.has_option(behavior_section, "keep_zip"):
+        raw = _norm_setting(parser.get(behavior_section, "keep_zip"))
         result = _match_setting(
             raw, "keep_zip",
             ((YES_VALUES, True), (NO_VALUES, False)),
@@ -331,8 +353,8 @@ def load_config():
             keep_zip = result
 
     # ---- crc_policy ----
-    if parser.has_option("behavior", "crc_policy"):
-        raw = _norm_setting(parser.get("behavior", "crc_policy"))
+    if behavior_section and parser.has_option(behavior_section, "crc_policy"):
+        raw = _norm_setting(parser.get(behavior_section, "crc_policy"))
         result = _match_setting(
             raw, "crc_policy",
             ((CRC_ASK_VALUES, "ask"), (CRC_STOP_VALUES, "stop")),
@@ -626,13 +648,13 @@ def get_downloads_dir():
 def format_size(num_bytes):
     """Человекочитаемый размер. Делим по сырому значению."""
     size = float(num_bytes)
-    for unit in ("Б", "КБ", "МБ", "ГБ"):
+    for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
         if size < 1024:
             if unit == "Б":
                 return f"{int(size)} {unit}"
             return f"{size:.1f} {unit}"
         size /= 1024
-    return f"{size:.1f} ТБ"
+    return f"{size:.1f} ПБ"
 
 
 def file_md5(path):
@@ -758,7 +780,9 @@ def warn_about_old_folders(extract_dir):
         return
 
     old_pattern = re.compile(r"\.old\d*$")
-    tmp_pattern = re.compile(r"^tmp[a-z0-9_]{8}$", re.IGNORECASE)
+    # Без IGNORECASE: tempfile называет временные папки только строчными
+    # [a-z0-9_], а "TMPABCDEFG1" пользователя удалять нельзя.
+    tmp_pattern = re.compile(r"^tmp[a-z0-9_]{8}$")
 
     leftover_old = sorted(
         p for p in extract_dir.iterdir()
@@ -820,7 +844,11 @@ def warn_about_old_folders(extract_dir):
 # ---------- Санитайз и валидация имени папки ----------
 
 def sanitize_folder_name(raw):
-    """Приводит имя из mod.io к безопасному виду."""
+    """Приводит имя из mod.io к безопасному виду.
+
+    Пробелы намеренно превращаем в _: имена папок в буфере делаем
+    однородными, без неоднозначных пробелов на концах и внутри.
+    ZIP-имена это не затрагивает (см. sanitize_zip_filename)."""
     forbidden = '\\/:*?"<>|'
     result = "".join("_" if (c in forbidden or c == " ") else c for c in raw)
     result = re.sub(r"_+", "_", result).strip("_")
@@ -829,7 +857,11 @@ def sanitize_folder_name(raw):
 
 
 def sanitize_zip_filename(name):
-    """Чистит имя ZIP-файла."""
+    """Чистит имя ZIP-файла.
+
+    Пробелы не трогаем: имена файлов в базе mod.io пробелов не
+    содержат, так что ветка «пробел → _» из sanitize_folder_name
+    здесь не нужна."""
     forbidden = '\\/:*?"<>|'
     cleaned = "".join(
         "_" if (c in forbidden or ord(c) < 32) else c
@@ -1256,6 +1288,8 @@ def _file_fits_target(item):
     for name, status in entries:
         # safe_int: если mod.io вернёт статус строкой ("2"), сравнение
         # "2" != 2 ошибочно сочло бы отклонённую платформу разрешённой.
+        # Статуса нет (None) = считаем разрешённым: лучше лишний файл,
+        # чем случайно выкинуть подходящий.
         if name in (TARGET_PLATFORM.upper(), "ALL") and safe_int(status) != 2:
             return True  # 2 = DENIED
 
@@ -1726,7 +1760,7 @@ def download_zip(file_info, output_dir, fallback_name, api_key=None):
 
     if not filename or not binary_url:
         raise RuntimeError(
-            "mod.io не вернул binary_url для этого файла."
+            "mod.io не вернул имя файла или binary_url для этого файла."
         )
 
     filesize = safe_non_negative_int(file_info.get("filesize"))
@@ -1961,8 +1995,6 @@ def download_zip(file_info, output_dir, fallback_name, api_key=None):
 
                     _print_download_progress(total, filesize)
 
-                    _print_download_progress(total, filesize)
-
                 if filesize is not None and total != filesize:
                     raise IncompleteDownload(
                         f"получено {total:,} из {filesize:,} байт (по метаданным mod.io)"
@@ -2175,6 +2207,10 @@ def _check_member_crc(raw, info):
                 pending = new_pending
 
         if decomp is not None:
+            # Поток deflate не дошёл до конца — данные обрезаны,
+            # даже если распакованные байты формально сошлись.
+            if not decomp.eof:
+                return "broken"
             data = decomp.flush()
             crc = zlib.crc32(data, crc)
             size += len(data)
@@ -2837,6 +2873,9 @@ def download_mod(mod, api_key, output_dir, file_info, mod_name=None,
 
             try:
                 file_info = fetch_file_info(mod_id, file_id, api_key)
+            except InvalidApiKeyError:
+                # Ключ истёк — это не «автор удалил файл».
+                raise
             except Exception as fetch_error:
                 raise RuntimeError(
                     "Автор удалил или заменил файл.\n"
@@ -3127,6 +3166,7 @@ def process_one_url(api_key, file_mode, name_mode, initial_url=None):
         print(f"Платформы: {platforms_text}")
 
     deps_to_install = []
+    deps_note = None
 
     if file_mode == MODE_FILE_ONE_DEPS:
         print()
@@ -3163,6 +3203,10 @@ def process_one_url(api_key, file_mode, name_mode, initial_url=None):
                     return "exit"
 
             deps_to_install = []
+            deps_note = (
+                "Зависимости пропущены из-за сбоя mod.io: "
+                "полный список получить не удалось."
+            )
 
         elif deps_status == DEPS_TRUNCATED:
             action = ask_truncated_action()
@@ -3171,6 +3215,10 @@ def process_one_url(api_key, file_mode, name_mode, initial_url=None):
                 print()
                 print("Продолжаю установку только базового мода.")
                 deps_to_install = []
+                deps_note = (
+                    f"Зависимости пропущены по твоему выбору: у мода больше "
+                    f"{DEPENDENCIES_PAGE_LIMIT} (потолок mod.io)."
+                )
             elif action == "retry_url":
                 return "retry_url"
             elif action == "restart":
@@ -3185,6 +3233,10 @@ def process_one_url(api_key, file_mode, name_mode, initial_url=None):
                 print()
                 print("Продолжаю установку только базового мода.")
                 deps_to_install = []
+                deps_note = (
+                    f"Зависимости пропущены по твоему выбору: их больше "
+                    f"{MAX_DEPENDENCIES} (лимит режима)."
+                )
             elif action == "retry_url":
                 return "retry_url"
             elif action == "restart":
@@ -3202,6 +3254,9 @@ def process_one_url(api_key, file_mode, name_mode, initial_url=None):
     downloads = get_downloads_dir()
 
     issues = []
+
+    if deps_note:
+        issues.append(deps_note)
 
     try:
         zip_path, status = download_mod(
@@ -3265,13 +3320,13 @@ def process_one_url(api_key, file_mode, name_mode, initial_url=None):
     if failed:
         print("Основной мод скачан, но эти зависимости скачать не удалось:")
         for name in failed:
-            print(f"  - {name}")
+            print(f"- {name}")
         print("Скачай их вручную на странице мода.")
 
     if issues:
         print("Скачано, но не всё в порядке:")
         for line in issues:
-            print(f"  - {line}")
+            print(f"- {line}")
 
     if not failed and not issues:
         if EXTRACT_DIR is None:
@@ -3368,7 +3423,7 @@ def main():
 
     except Exception as e:
         print()
-        print("ОШИБКА:")
+        print("Ошибка:")
         print(mask_key(e, api_key))
         print()
         sys.exit(1)
