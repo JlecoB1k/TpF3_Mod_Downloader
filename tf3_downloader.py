@@ -8,6 +8,7 @@ import shutil
 import struct
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 import zlib
@@ -35,7 +36,7 @@ except ModuleNotFoundError:
     sys.exit(1)
 
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 GAME_ID = 10640
 API_BASE = f"https://g-{GAME_ID}.modapi.io/v1"
@@ -709,6 +710,61 @@ def _print_download_progress(total, filesize, speed=None):
     print_progress(line)
 
 
+class _WaitTicker:
+    """Живой счётчик секунд для фаз ожидания скачивания.
+
+    На фазах «Подключаюсь к серверу загрузки» и «Соединение
+    установлено, жду данные» основной поток блокирован в requests
+    и ничего не печатает — до ~105 секунд неподвижного экрана,
+    что выглядит как зависание. Фоновый daemon-поток раз в секунду
+    перезаписывает строку ожидания, дописывая прошедшие секунды.
+    """
+
+    def __init__(self, interval=1.0):
+        self._interval = interval
+        self._stop_event = threading.Event()
+        self._started = 0.0
+        self._text = ""
+        self._lock = threading.Lock()
+        self._thread = None
+
+    def start(self, text):
+        """Печатает строку ожидания и запускает счётчик."""
+        self._text = text
+        self._started = time.monotonic()
+        print_progress(f"{text}...")
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def retext(self, text):
+        """Меняет подпись и обнуляет счётчик (например, после соединения)."""
+        with self._lock:
+            self._text = text
+            self._started = time.monotonic()
+        print_progress(f"{text}...")
+
+    def stop(self):
+        """Гасит счётчик и стирает строку ожидания с экрана.
+
+        Строка ожидания — временный статус, после себя её надо убрать,
+        чтобы следующий обычный print не приклеился к «...N сек».
+        Повторный вызов и вызов без start() безопасны и экран не трогают."""
+        if self._thread is None:
+            return
+
+        self._stop_event.set()
+        self._thread.join(timeout=2.0)
+        self._thread = None
+        print("\r" + " " * 80 + "\r", end="", flush=True)
+
+    def _run(self):
+        while not self._stop_event.wait(self._interval):
+            with self._lock:
+                text = self._text
+                elapsed = int(time.monotonic() - self._started)
+            print_progress(f"{text}... {elapsed} сек")
+
+
 def _print_retry_message(error, attempt):
     """Печатает сообщение о повторе скачивания и возвращает паузу.
 
@@ -846,12 +902,56 @@ def warn_about_old_folders(extract_dir):
 def sanitize_folder_name(raw):
     """Приводит имя из mod.io к безопасному виду.
 
-    Пробелы намеренно превращаем в _: имена папок в буфере делаем
-    однородными, без неоднозначных пробелов на концах и внутри.
-    ZIP-имена это не затрагивает (см. sanitize_zip_filename)."""
-    forbidden = '\\/:*?"<>|'
-    result = "".join("_" if (c in forbidden or c == " ") else c for c in raw)
-    result = re.sub(r"_+", "_", result).strip("_")
+    В автоимени папки оставляем только буквы, цифры, "_", круглые
+    скобки и точку; всё остальное (пробелы, дефисы, запятые и т.п.)
+    превращается в "_". Дальше:
+      - скобочные пары без содержательного наполнения (пустые или
+        только с "_"/".") убираются вместе с содержимым, непарные
+        скобки — тоже; содержательные вроде "(fix)" остаются;
+      - группы из точек и подчёркиваний сжимаются в один символ:
+        "_" если в группе есть подчёркивание, иначе "."; одиночная
+        точка не трогается ("BR_210.0", "v1.2");
+      - краевые "_" и "." срезаются.
+    Пустой результат — имя не годится, вызывающий код попросит
+    ввести его вручную. ZIP-имена это не затрагивает (см.
+    sanitize_zip_filename)."""
+    def keep(c):
+        return c.isalpha() or c.isdigit() or c in "_()."
+
+    result = "".join(c if keep(c) else "_" for c in raw)
+
+    # Скобки: сначала пары-пустышки — пустые или заполненные только
+    # "_"/".". Циклом, чтобы снятие внутренней открывало внешние
+    # ("(((_)))" схлопывается целиком).
+    junk_pair = re.compile(r"\([_ .]*\)")
+    while junk_pair.search(result):
+        result = junk_pair.sub("", result)
+
+    # Непарные скобки ("Mod_(v2", "))))(((") — шум для имени папки:
+    # скобки убираем, содержимое при нём остаётся.
+    keep_flags = [True] * len(result)
+    opened = []
+    for i, c in enumerate(result):
+        if c == "(":
+            opened.append(i)
+        elif c == ")":
+            if opened:
+                opened.pop()
+            else:
+                keep_flags[i] = False
+    for i in opened:
+        keep_flags[i] = False
+    result = "".join(c for c, k in zip(result, keep_flags) if k)
+
+    # Группа из "." и "_" → один символ: "_", если в группе был
+    # подчёркивание, иначе "." ("Mod... v2" → "Mod_v2", "v1..2" → "v1.2").
+    result = re.sub(
+        r"[._]+",
+        lambda m: "_" if "_" in m.group() else ".",
+        result,
+    )
+    result = result.strip("._")
+
     was_changed = (result != raw)
     return result, was_changed
 
@@ -1195,6 +1295,13 @@ def api_get(path, api_key, params=None):
     params["api_key"] = api_key
 
     for attempt in range(1, MAX_RETRIES + 1):
+        # Тикер живёт ТОЛЬКО внутри сетевого вызова: всё окно коннекта
+        # и ожидания ответа экран не молчит. Все сообщения (ретраи,
+        # ошибки) печатаются строго после его остановки — иначе он
+        # затирает их своими \r-строками.
+        ticker = _WaitTicker()
+        ticker.start("Связываюсь с mod.io")
+
         try:
             response = _SESSION.get(
                 API_BASE + path,
@@ -1202,6 +1309,7 @@ def api_get(path, api_key, params=None):
                 timeout=(10, 80),
             )
         except requests.exceptions.RequestException as e:
+            ticker.stop()
             if attempt < MAX_RETRIES:
                 print(f"Сетевая ошибка, повтор через 2 сек... ({attempt}/{MAX_RETRIES})")
                 time.sleep(2)
@@ -1210,6 +1318,9 @@ def api_get(path, api_key, params=None):
             raise RuntimeError(
                 "Не удалось связаться с mod.io:\n" + mask_key(e, api_key)
             ) from None
+
+        finally:
+            ticker.stop()
 
         if response.status_code in RETRYABLE_API_STATUSES and attempt < MAX_RETRIES:
             raw = response.headers.get("Retry-After", "")
@@ -1882,17 +1993,18 @@ def download_zip(file_info, output_dir, fallback_name, api_key=None):
             total = 0
             server_size = None
 
+            ticker = _WaitTicker()
             try:
                 if attempt == 1 and md5_attempt == 1:
-                    print_progress("Подключаюсь к серверу загрузки...")
+                    ticker.start("Подключаюсь к серверу загрузки")
                 elif attempt == 1:
-                    print_progress(
-                        "Подключаюсь к серверу загрузки (повторное скачивание)..."
+                    ticker.start(
+                        "Подключаюсь к серверу загрузки (повторное скачивание)"
                     )
                 else:
-                    print_progress(
+                    ticker.start(
                         "Подключаюсь к серверу загрузки "
-                        f"(попытка {attempt}/{MAX_DOWNLOAD_RETRIES})..."
+                        f"(попытка {attempt}/{MAX_DOWNLOAD_RETRIES})"
                     )
 
                 with _SESSION.get(
@@ -1944,7 +2056,7 @@ def download_zip(file_info, output_dir, fallback_name, api_key=None):
                             "Запусти скрипт ещё раз."
                         )
 
-                    print_progress("Соединение установлено, жду данные...")
+                    ticker.retext("Соединение установлено, жду данные")
 
                     last_update = 0.0
                     # Скользящее окно скорости: замеры (время, байты) за ~3 сек.
@@ -1956,6 +2068,9 @@ def download_zip(file_info, output_dir, fallback_name, api_key=None):
                             if not chunk:
                                 continue
 
+                            # Первый байт получен — ожидание закончилось,
+                            # дальше строкой владеет прогресс скачивания.
+                            ticker.stop()
                             f.write(chunk)
                             md5.update(chunk)
                             total += len(chunk)
@@ -2034,6 +2149,7 @@ def download_zip(file_info, output_dir, fallback_name, api_key=None):
                 # Один общий обработчик для всех retryable-ошибок.
                 # Сообщение о повторе печатает _print_retry_message.
                 last_error = e
+                ticker.stop()
                 print()
                 if attempt < MAX_DOWNLOAD_RETRIES:
                     wait = _print_retry_message(e, attempt)
@@ -2053,6 +2169,7 @@ def download_zip(file_info, output_dir, fallback_name, api_key=None):
                 # Прочие ошибки requests (InvalidURL, MissingSchema,
                 # битая схема). Не retryable — падаем сразу, но маскируем
                 # binary_url в тексте, там может быть токен.
+                ticker.stop()
                 try:
                     tmp_path.unlink(missing_ok=True)
                 except OSError:
@@ -2073,6 +2190,10 @@ def download_zip(file_info, output_dir, fallback_name, api_key=None):
                 except OSError:
                     pass
                 raise
+            finally:
+                # Тикер обязан быть погашен на любом исходе попытки:
+                # иначе он затрёт сообщение об ошибке или ретрае.
+                ticker.stop()
 
         if download_ok:
             break
@@ -2372,6 +2493,11 @@ def extract_zip(zip_path, extract_root, mod_name=None, name_mode=MODE_NAME_AUTO,
 
         for m in members:
             _fix_zip_member_encoding(m)
+            # Часть архиваторов кладёт в ZIP имена с обратными слэшами.
+            # Без нормализации здесь ломаются определение корневой папки
+            # и расчёт длин путей, а на Windows распаковка падает с
+            # бессмысленным «Не удалось записать файлы».
+            m.filename = m.filename.replace("\\", "/")
 
         names = [
             i.filename[2:] if i.filename.startswith("./") else i.filename
@@ -2950,11 +3076,12 @@ def download_mod(mod, api_key, output_dir, file_info, mod_name=None,
 def process_dependencies(dependencies, api_key, downloads, name_mode, issues):
     """Скачивает список зависимостей."""
     failed = []
+    total = len(dependencies)
 
-    for dep_id, dep_name in dependencies:
+    for index, (dep_id, dep_name) in enumerate(dependencies, start=1):
         print()
         print("=" * 60)
-        print(f"Зависимость: {dep_name} (ID {dep_id})")
+        print(f"Зависимость {index} из {total}: {dep_name} (ID {dep_id})")
         print("=" * 60)
 
         try:
