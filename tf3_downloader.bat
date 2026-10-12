@@ -52,6 +52,7 @@ set RC=%errorlevel%
 
 if %RC%==0 goto :ok
 if %RC%==2 goto :warn
+if %RC%==3 goto :stop
 goto :err
 
 :ok
@@ -60,6 +61,10 @@ goto :end
 
 :warn
 echo Finished with warnings. See summary above.
+goto :end
+
+:stop
+echo Stopped by your choice.
 goto :end
 
 :err

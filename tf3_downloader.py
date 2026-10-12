@@ -36,7 +36,7 @@ except ModuleNotFoundError:
     sys.exit(1)
 
 
-VERSION = "1.0.2"
+VERSION = "1.0.5"
 
 GAME_ID = 10640
 API_BASE = f"https://g-{GAME_ID}.modapi.io/v1"
@@ -2269,29 +2269,30 @@ def _extract_without_crc_check(zf, tmp_path, members):
 def _check_member_crc(raw, info):
     """Проверяет один файл в архиве, ничего не распаковывая на диск.
 
-    Возвращает:
+    Возвращает пару (статус, причина):
       "ok"      — всё сходится;
       "crc"     — данные распаковались, длина верна, не сходится только CRC;
       "broken"  — данные повреждены (не распаковываются, не та длина, обрезано);
       "unknown" — проверить не умеем (шифрование, редкий метод сжатия).
+    Причина — короткий текст для пользователя (для "ok" и "crc" пустой).
     """
     if info.flag_bits & 0x1:
-        return "unknown"
+        return "unknown", "зашифрован"
 
     if info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
-        return "unknown"
+        return "unknown", "редкий метод сжатия"
 
     try:
         raw.seek(info.header_offset)
         header = raw.read(_LOCAL_HEADER.size)
 
         if len(header) < _LOCAL_HEADER.size:
-            return "broken"
+            return "broken", "файл обрезан"
 
         fields = _LOCAL_HEADER.unpack(header)
 
         if fields[0] != b"PK\x03\x04":
-            return "broken"
+            return "broken", "повреждён заголовок файла"
 
         raw.seek(info.header_offset + _LOCAL_HEADER.size + fields[9] + fields[10])
 
@@ -2307,7 +2308,7 @@ def _check_member_crc(raw, info):
             chunk = raw.read(min(1 << 20, remaining))
 
             if not chunk:
-                return "broken"
+                return "broken", "файл обрезан"
 
             remaining -= len(chunk)
 
@@ -2331,40 +2332,55 @@ def _check_member_crc(raw, info):
             # Поток deflate не дошёл до конца — данные обрезаны,
             # даже если распакованные байты формально сошлись.
             if not decomp.eof:
-                return "broken"
+                return "broken", "файл обрезан"
             data = decomp.flush()
             crc = zlib.crc32(data, crc)
             size += len(data)
 
-    except (OSError, zlib.error, struct.error):
-        return "broken"
+    except zlib.error:
+        return "broken", "данные сжатия повреждены"
+    except (OSError, struct.error):
+        return "broken", "не удалось прочитать"
 
     if size != info.file_size:
-        return "broken"
+        return "broken", "размер не совпал с заявленным"
 
-    return "ok" if (crc & 0xFFFFFFFF) == info.CRC else "crc"
+    if (crc & 0xFFFFFFFF) == info.CRC:
+        return "ok", ""
+
+    return "crc", ""
 
 
-def _find_crc_only_problems(zip_path, files):
-    """Имена файлов, у которых не сходится только CRC.
+def _scan_archive(zip_path, files):
+    """Проверяет все файлы архива, ничего не распаковывая.
 
-    Пустой список — если таких нет или в архиве есть настоящая порча
-    (или файлы, которые мы не умеем проверить): тогда продолжать нельзя."""
+    Возвращает (crc_names, broken):
+      crc_names — имена файлов, у которых не сходится только CRC;
+      broken    — пары (имя, причина) для файлов, которые распаковать
+                  нельзя (порча) или проверить не удалось.
+    Оба списка пусты — по отдельным файлам проблем не найдено (или сам
+    архив не удалось прочитать).
+    """
     crc_names = []
+    broken = []
 
     try:
         with open(zip_path, "rb") as raw:
             for info in files:
-                result = _check_member_crc(raw, info)
+                status, reason = _check_member_crc(raw, info)
 
-                if result == "crc":
+                if status == "crc":
                     crc_names.append(info.filename)
-                elif result in ("broken", "unknown"):
-                    return []
+                elif status == "broken":
+                    broken.append((info.filename, reason))
+                elif status == "unknown":
+                    broken.append(
+                        (info.filename, f"не удалось проверить: {reason}")
+                    )
     except OSError:
-        return []
+        return [], []
 
-    return crc_names
+    return crc_names, broken
 
 
 def _crc_stop_text(crc_names, total_files):
@@ -2387,6 +2403,77 @@ def _crc_stop_text(crc_names, total_files):
         "Чтобы спрашивать вместо остановки, поставь в config.ini: crc_policy = спрашивать",
     ]
     return "\n".join(lines)
+
+
+def _limited_list(items, fmt):
+    """Строки списка (не больше CRC_LIST_LIMIT), остаток — «…и ещё N»."""
+    lines = [fmt(item) for item in items[:CRC_LIST_LIMIT]]
+
+    rest = len(items) - CRC_LIST_LIMIT
+    if rest > 0:
+        lines.append(f"…и ещё {rest}")
+
+    return lines
+
+
+_MANUAL_UNPACK_RISK = (
+    "\n\nНа свой страх и риск!\n"
+    "Можно распаковать вручную, но проблемные файлы "
+    "могут быть окончательно повреждены."
+)
+
+
+def _corruption_text(crc_names, broken, total_files, md5_verified):
+    """Текст для архива, где есть файлы, которые распаковать нельзя."""
+    lines = [
+        "=" * 60,
+        "Архив повреждён: не могу распаковать.",
+        "=" * 60,
+        f"Повреждённых файлов: {len(broken)} из {total_files}",
+    ]
+    lines += _limited_list(broken, lambda item: f"- {item[0]} — {item[1]}")
+
+    if crc_names:
+        lines += ["", f"Кроме них, ошибка только в CRC у: {len(crc_names)}"]
+        lines += _limited_list(crc_names, lambda name: f"- {name}")
+        lines += ["", "Обход CRC здесь не поможет: часть данных не читается."]
+
+    lines.append("")
+
+    if md5_verified:
+        lines += [
+            "Скачивание прошло без ошибок («Проверка MD5: OK»):",
+            "Такой же архив лежит на mod.io. Повторное скачивание не поможет.",
+            "Можно проверить архив в 7-Zip («Тестировать»):",
+            "Если он тоже ругается, сообщи автору мода об ошибке.",
+        ]
+    else:
+        lines += [
+            "Проверка MD5 пропущена: mod.io не передал контрольную сумму,",
+            "поэтому файл мог повредиться при скачивании. Попробуй скачать ещё раз.",
+            "Проверь архив в 7-Zip («Тестировать»): если он тоже ругается,",
+            "напиши автору мода, чтобы перезалил файл.",
+        ]
+
+    return "\n".join(lines)
+
+
+def _unreadable_text(error, after_crc_bypass=False):
+    """Текст, когда zipfile отказывается, а по файлам проблем не найдено
+    (или отказал уже после обхода CRC)."""
+    if after_crc_bypass:
+        first = "Архив не распаковался даже без проверки CRC."
+    else:
+        first = (
+            "Архив не прошёл проверку, хотя по отдельным файлам "
+            "проблем не найдено."
+        )
+
+    return "\n".join([
+        first,
+        f"Причина от zipfile: {error}",
+        "Проверь архив в 7-Zip («Тестировать»).",
+    ])
 
 
 def _show_crc_warning(crc_names, total_files, md5_verified):
@@ -2580,7 +2667,7 @@ def extract_zip(zip_path, extract_root, mod_name=None, name_mode=MODE_NAME_AUTO,
                 f"({len(final_path_str)} символов, максимум {MAX_MOD_PATH_LEN}).\n"
                 "Внутри мода могут быть вложенные файлы, для которых не хватит "
                 "запаса Windows до лимита длины пути (260 символов).\n"
-                "Сократи EXTRACT_DIR или выбери более короткое имя папки."
+                "Сократи extract_dir в config.ini или выбери более короткое имя папки."
             )
 
         # Распаковка идёт сначала во временную папку вида
@@ -2672,28 +2759,34 @@ def extract_zip(zip_path, extract_root, mod_name=None, name_mode=MODE_NAME_AUTO,
                     # Bad CRC-32 и подобное: данные внутри архива не сходятся
                     # с его же контрольной суммой. К символам и длине пути
                     # это отношения не имеет.
-                    crc_names = []
                     can_skip = _can_skip_crc_check()
 
-                    # Диагностика CRC не требует monkey-patch — её можно
-                    # сделать всегда, а обход распаковки — только если can_skip.
-                    if not crc_confirmed:
-                        crc_names = _find_crc_only_problems(zip_path, real_files)
+                    if crc_confirmed:
+                        # Контрольные суммы уже обходили, а архив всё равно
+                        # не читается: дело не только в CRC.
+                        raise RuntimeError(
+                            _unreadable_text(e, after_crc_bypass=True)
+                            + old_note
+                        ) from e
+
+                    # Диагностика не требует monkey-patch — её можно сделать
+                    # всегда, а обход распаковки — только если can_skip.
+                    crc_names, broken = _scan_archive(zip_path, real_files)
+
+                    if broken:
+                        # Настоящая порча: продолжать нельзя.
+                        raise RuntimeError(
+                            _corruption_text(
+                                crc_names, broken, len(real_files), md5_verified
+                            )
+                            + old_note
+                            + _MANUAL_UNPACK_RISK
+                        ) from e
 
                     if not crc_names:
-                        # Настоящая порча (или нечем проверить): продолжать нельзя.
+                        # По файлам проблем не нашли, но zipfile отказывается.
                         raise RuntimeError(
-                            "Архив повреждён внутри! Данные файла не сходятся "
-                            "с контрольной суммой (CRC).\n"
-                            f"Причина: {e}\n"
-                            "Если при скачивании было «Проверка MD5: OK», файл "
-                            "совпадает с тем, что лежит на mod.io.\n"
-                            "Скорее всего, архив битый у источника. "
-                            "Повторное скачивание не поможет.\n"
-                            "Проверь архив в 7-Zip («Тестировать»): если он тоже "
-                            "ругается, напиши автору мода, чтобы перезалил файл."
-                            + old_note
-                            + "\n\nМожно распаковать вручную, но на свой страх и риск!"
+                            _unreadable_text(e) + old_note
                         ) from e
 
                     if not can_skip:
@@ -2742,8 +2835,9 @@ def extract_zip(zip_path, extract_root, mod_name=None, name_mode=MODE_NAME_AUTO,
                     raise RuntimeError(
                         "Архив обрезан или данные сжатия повреждены.\n"
                         f"Причина: {e}\n"
-                        "Скорее всего, файл битый. Попробуй скачать заново, "
-                        "а если не поможет — напиши автору мода."
+                        "Скорее всего, файл битый.\n"
+                        "Попробуй скачать заново, а если не поможет — "
+                        "сообщи автору мода об ошибке."
                         + old_note
                     ) from e
                 except NotImplementedError as e:
@@ -3218,7 +3312,9 @@ def process_one_url(api_key, file_mode, name_mode, initial_url=None):
     """Обрабатывает одну ссылку.
 
     Возвращает:
-      "done" / "warn" / "exit" / "retry_url" / "restart".
+      "done" / "warn" / "exit" / "stop" / "retry_url" / "restart".
+    "stop" — пользователь сам выбрал закончить работу (код выхода 3),
+    "exit" — работа прервана из-за ошибки (код выхода 1).
     """
     if initial_url is not None:
         mod_url = initial_url
@@ -3320,14 +3416,14 @@ def process_one_url(api_key, file_mode, name_mode, initial_url=None):
 
                 action = ask_api_error_no_zip_action()
                 if action == "exit":
-                    return "exit"
+                    return "stop"
             else:
                 print(f"В Downloads есть валидный ZIP: {valid_zip.name}")
                 print("=" * 60)
 
                 action = ask_api_error_with_zip_action()
                 if action == "exit":
-                    return "exit"
+                    return "stop"
 
             deps_to_install = []
             deps_note = (
@@ -3351,7 +3447,7 @@ def process_one_url(api_key, file_mode, name_mode, initial_url=None):
             elif action == "restart":
                 return "restart"
             elif action == "exit":
-                return "exit"
+                return "stop"
 
         elif deps_status == DEPS_EXCEEDED:
             action = ask_exceeded_action()
@@ -3369,7 +3465,7 @@ def process_one_url(api_key, file_mode, name_mode, initial_url=None):
             elif action == "restart":
                 return "restart"
             elif action == "exit":
-                return "exit"
+                return "stop"
 
         else:
             deps_to_install = deps_list
@@ -3529,6 +3625,11 @@ def main():
             if action == "warn":
                 sys.exit(2)
 
+            if action == "stop":
+                print()
+                print("Работа завершена по твоему выбору.")
+                sys.exit(3)
+
             if action == "exit":
                 sys.exit(1)
 
@@ -3561,7 +3662,4 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\nОстановлено.")
-        sys.exit(1)
-    except EOFError:
-        print("\nВвод прерван.")
         sys.exit(1)
