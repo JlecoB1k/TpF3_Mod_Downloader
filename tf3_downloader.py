@@ -36,7 +36,7 @@ except ModuleNotFoundError:
     sys.exit(1)
 
 
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 
 GAME_ID = 10640
 API_BASE = f"https://g-{GAME_ID}.modapi.io/v1"
@@ -84,6 +84,18 @@ MAX_KEY_ATTEMPTS = 3
 
 class InvalidApiKeyError(RuntimeError):
     """mod.io не принял API key (HTTP 401)."""
+
+
+class ModioNetworkError(RuntimeError):
+    """Не удалось связаться с mod.io (таймаут, обрыв соединения)."""
+
+
+class ModioHttpError(RuntimeError):
+    """mod.io ответил HTTP-ошибкой (не 200 и не 401)."""
+
+    def __init__(self, status_code, message):
+        self.status_code = status_code
+        super().__init__(message)
 
 # ---------- Настройки распаковки ----------
 # Значения по умолчанию. Реальные настройки читаются из config.ini
@@ -249,7 +261,17 @@ def _path_from_config(raw_value, problems, key):
     if not value:
         return None
 
-    candidate = Path(value)
+    # Раскрываем ~ и переменные окружения (например, %USERPROFILE%\Моды).
+    expanded = os.path.expandvars(os.path.expanduser(value))
+
+    leftover = re.search(r"%[^%\\/]+%", expanded)
+    if leftover:
+        problems.append(
+            f"Настройка {key}: переменная {leftover.group(0)} не найдена."
+        )
+        return None
+
+    candidate = Path(expanded)
 
     if not candidate.is_absolute():
         problems.append(
@@ -521,6 +543,18 @@ def _key_is_valid(api_key):
     Остальные ошибки (сеть, 5xx, 403) пробрасываются как есть,
     чтобы не выдавать их за «неверный ключ»."""
     try:
+        # Лёгкий запрос (данные игры): не зависит от того, какие моды
+        # окажутся первыми в выдаче списка.
+        api_get(f"/games/{GAME_ID}", api_key, read_timeout=20, network_retries=1)
+        return True
+    except InvalidApiKeyError:
+        return False
+    except RuntimeError:
+        # Любой другой сбой — не повод считать ключ плохим. Пробуем
+        # прежний способ проверки через список модов.
+        pass
+
+    try:
         api_get(f"/games/{GAME_ID}/mods", api_key, {"_limit": 1})
     except InvalidApiKeyError:
         return False
@@ -629,10 +663,64 @@ def host_is_known_cdn(url):
     return False
 
 
+def _windows_downloads_dir():
+    """Настоящая папка «Загрузки» по данным Windows (Known Folder API).
+
+    Учитывает перенос папки на другой диск. None — не Windows или
+    определить не удалось; тогда работает прежний запасной путь."""
+    if os.name != "nt":
+        return None
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD),
+                ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        # FOLDERID_Downloads = {374DE290-123F-4565-9164-39C4925E467B}
+        folder_id = GUID(
+            0x374DE290, 0x123F, 0x4565,
+            (ctypes.c_ubyte * 8)(0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B),
+        )
+
+        shell32 = ctypes.windll.shell32
+        ole32 = ctypes.windll.ole32
+        shell32.SHGetKnownFolderPath.argtypes = [
+            ctypes.POINTER(GUID), wintypes.DWORD, wintypes.HANDLE,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+        ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+
+        buf = ctypes.c_void_p()
+        hr = shell32.SHGetKnownFolderPath(
+            ctypes.byref(folder_id), 0, None, ctypes.byref(buf)
+        )
+
+        try:
+            if hr != 0 or not buf.value:
+                return None
+            return Path(ctypes.wstring_at(buf.value))
+        finally:
+            ole32.CoTaskMemFree(buf)
+    except Exception:
+        return None
+
+
 def get_downloads_dir():
     """Возвращает путь к папке загрузок."""
     if DOWNLOADS_DIR is not None:
         return DOWNLOADS_DIR
+
+    known = _windows_downloads_dir()
+    if known is not None and known.is_dir():
+        return known
 
     home = Path.home()
 
@@ -1289,12 +1377,20 @@ def get_mod_slug(url):
     return mod_slug
 
 
-def api_get(path, api_key, params=None):
-    """GET-запрос к API mod.io с ретраями."""
+def api_get(path, api_key, params=None, read_timeout=80,
+            max_retries=MAX_RETRIES, network_retries=None):
+    """GET-запрос к API mod.io с ретраями.
+
+    max_retries     — сколько всего попыток при ответах 429/5xx;
+    network_retries — сколько всего попыток при сетевых сбоях (таймаут,
+                      обрыв). None — столько же, сколько max_retries."""
     params = dict(params or {})
     params["api_key"] = api_key
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    if network_retries is None:
+        network_retries = max_retries
+
+    for attempt in range(1, max(max_retries, network_retries) + 1):
         # Тикер живёт ТОЛЬКО внутри сетевого вызова: всё окно коннекта
         # и ожидания ответа экран не молчит. Все сообщения (ретраи,
         # ошибки) печатаются строго после его остановки — иначе он
@@ -1306,23 +1402,23 @@ def api_get(path, api_key, params=None):
             response = _SESSION.get(
                 API_BASE + path,
                 params=params,
-                timeout=(10, 80),
+                timeout=(10, read_timeout),
             )
         except requests.exceptions.RequestException as e:
             ticker.stop()
-            if attempt < MAX_RETRIES:
-                print(f"Сетевая ошибка, повтор через 2 сек... ({attempt}/{MAX_RETRIES})")
+            if attempt < network_retries:
+                print(f"Сетевая ошибка, повтор через 2 сек... ({attempt}/{network_retries})")
                 time.sleep(2)
                 continue
 
-            raise RuntimeError(
+            raise ModioNetworkError(
                 "Не удалось связаться с mod.io:\n" + mask_key(e, api_key)
             ) from None
 
         finally:
             ticker.stop()
 
-        if response.status_code in RETRYABLE_API_STATUSES and attempt < MAX_RETRIES:
+        if response.status_code in RETRYABLE_API_STATUSES and attempt < max_retries:
             raw = response.headers.get("Retry-After", "")
             try:
                 wait = int(raw)
@@ -1330,7 +1426,7 @@ def api_get(path, api_key, params=None):
                 wait = 5 * attempt
 
             wait = max(1, min(wait, 60))
-            print(f"mod.io просит подождать, повтор через {wait} сек... ({attempt}/{MAX_RETRIES})")
+            print(f"mod.io просит подождать, повтор через {wait} сек... ({attempt}/{max_retries})")
             time.sleep(wait)
             continue
 
@@ -1341,9 +1437,10 @@ def api_get(path, api_key, params=None):
             )
 
         if response.status_code != 200:
-            raise RuntimeError(
+            raise ModioHttpError(
+                response.status_code,
                 f"mod.io вернул HTTP {response.status_code}:\n"
-                f"{mask_key(response.text[:2000], api_key)}"
+                f"{mask_key(response.text[:2000], api_key)}",
             )
 
         try:
@@ -1542,6 +1639,19 @@ def resolve_file_info(mod, mod_id, api_key, ask=True):
     всего пакетного режима (несколько файлов за запуск). Там
     «предыдущего одобрения» пользователя нет, и политику выбора файла
     под платформу надо будет задать отдельно и осознанно."""
+    if mod.get("_no_card"):
+        # Карточка мода недоступна (mod.io на неё не отвечает): файл берём
+        # из списка файлов мода, он отвечает отдельно.
+        best = _find_target_file(mod_id, api_key)
+        best_id = safe_non_negative_int(best.get("id")) if best else None
+
+        if not best_id:
+            raise RuntimeError(
+                "Не удалось найти подходящий файл в списке файлов мода."
+            )
+
+        return best_id, fetch_file_info(mod_id, best_id, api_key)
+
     file_id = get_current_file_id(mod, api_key)
     file_info = fetch_file_info(mod_id, file_id, api_key)
 
@@ -3093,14 +3203,27 @@ def download_mod(mod, api_key, output_dir, file_info, mod_name=None,
 
             try:
                 file_info = fetch_file_info(mod_id, file_id, api_key)
-            except InvalidApiKeyError:
-                # Ключ истёк — это не «автор удалил файл».
+            except (InvalidApiKeyError, ModioNetworkError):
+                # Ключ истёк или нет связи — это не «автор удалил файл».
                 raise
+            except ModioHttpError as fetch_error:
+                if fetch_error.status_code in (404, 410):
+                    raise RuntimeError(
+                        "Автор удалил или заменил файл.\n"
+                        "Проверь наличие мода и файла на странице, "
+                        "либо запусти скрипт заново.\n"
+                        f"Причина: {mask_key(fetch_error, api_key)}"
+                    ) from fetch_error
+
+                raise RuntimeError(
+                    "Не удалось обновить ссылку на файл: "
+                    f"mod.io ответил HTTP {fetch_error.status_code}.\n"
+                    "Скорее всего, проблема временная — попробуй позже.\n"
+                    f"Причина: {mask_key(fetch_error, api_key)}"
+                ) from fetch_error
             except Exception as fetch_error:
                 raise RuntimeError(
-                    "Автор удалил или заменил файл.\n"
-                    "Проверь наличие мода и файла на странице, "
-                    "либо запусти скрипт заново.\n"
+                    "Не удалось обновить ссылку на файл.\n"
                     f"Причина: {mask_key(fetch_error, api_key)}"
                 ) from fetch_error
 
@@ -3179,7 +3302,27 @@ def process_dependencies(dependencies, api_key, downloads, name_mode, issues):
         print("=" * 60)
 
         try:
-            dep_mod = api_get(f"/games/{GAME_ID}/mods/{dep_id}", api_key)
+            try:
+                dep_mod = api_get(
+                    f"/games/{GAME_ID}/mods/{dep_id}",
+                    api_key,
+                    read_timeout=80,
+                    network_retries=2,
+                )
+            except ModioNetworkError:
+                # Карточка зависимости не отвечает. ID и название уже
+                # известны из списка зависимостей: файл берём напрямую
+                # через /files, как и для основного мода.
+                print(
+                    "mod.io не отдаёт карточку этой зависимости, "
+                    "беру файл по ID..."
+                )
+                dep_mod = {
+                    "id": dep_id,
+                    "name": dep_name,
+                    "name_id": "",
+                    "_no_card": True,
+                }
 
             dep_display_name = (
                 dep_mod.get("name")
@@ -3308,6 +3451,39 @@ def ask_api_error_no_zip_action():
         print("Непонятный ответ. Введи 1 или 2.")
 
 
+def _ask_mod_without_card(mod_slug):
+    """Запасной путь, когда mod.io не отвечает на поиск мода.
+
+    Просит ввести числовой ID мода и возвращает «облегчённую» карточку
+    (без данных, которые приходят только из самого поиска).
+    None — пользователь отказался."""
+    print()
+    print("Скрипт не может найти этот мод, mod.io не отвечает на поиск.")
+    print("Это исключительно редкая ошибка.")
+    print("Поиск можно обойти, если знать числовой ID мода.")
+    print("Введи ID мода (число) или оставь пустую строку, чтобы вернуться к ссылке.")
+    print("Сам ID можно найти на странице мода в панели с информацией о нем.")
+    print("Имей в виду: скрипт не может проверить, что ID относится именно к этому моду.")
+    print("Если ввести не тот ID, скачается другой мод.")
+    print()
+
+    while True:
+        raw = input("ID мода:\n> ").strip()
+
+        if not raw:
+            return None
+
+        if raw.isdigit() and int(raw) > 0:
+            return {
+                "id": int(raw),
+                "name_id": mod_slug.lower(),
+                "name": mod_slug,
+                "_no_card": True,
+            }
+
+        print("ID — это число, например 6432550.")
+
+
 def process_one_url(api_key, file_mode, name_mode, initial_url=None):
     """Обрабатывает одну ссылку.
 
@@ -3337,31 +3513,44 @@ def process_one_url(api_key, file_mode, name_mode, initial_url=None):
 
     mod_slug_lower = mod_slug.lower()
 
-    data = api_get(
-        f"/games/{GAME_ID}/mods",
-        api_key,
-        {
-            "name_id": mod_slug_lower,
-            "_limit": 1,
-        },
-    )
+    mod = None
 
-    if not isinstance(data, dict):
-        print()
-        print("mod.io вернул неожиданный формат ответа для списка модов.")
-        return "retry_url"
+    try:
+        data = api_get(
+            f"/games/{GAME_ID}/mods",
+            api_key,
+            {
+                "name_id": mod_slug_lower,
+                "_limit": 1,
+            },
+            read_timeout=25,
+            network_retries=2,
+        )
+    except ModioNetworkError:
+        mod = _ask_mod_without_card(mod_slug)
 
-    matches = [
-        m for m in (data.get("data") or [])
-        if isinstance(m, dict) and (m.get("name_id") or "").lower() == mod_slug_lower
-    ]
+        if mod is None:
+            return "retry_url"
 
-    if not matches:
-        print()
-        print("Точный мод по этой ссылке не найден через API.")
-        return "retry_url"
+        data = None
 
-    mod = matches[0]
+    if mod is None:
+        if not isinstance(data, dict):
+            print()
+            print("mod.io вернул неожиданный формат ответа для списка модов.")
+            return "retry_url"
+
+        matches = [
+            m for m in (data.get("data") or [])
+            if isinstance(m, dict) and (m.get("name_id") or "").lower() == mod_slug_lower
+        ]
+
+        if not matches:
+            print()
+            print("Точный мод по этой ссылке не найден через API.")
+            return "retry_url"
+
+        mod = matches[0]
 
     mod_id = safe_non_negative_int(mod.get("id"))
     if mod_id is None:
@@ -3662,4 +3851,5 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\nОстановлено.")
+        sys.exit(3)
         sys.exit(1)
