@@ -36,14 +36,20 @@ except ModuleNotFoundError:
     sys.exit(1)
 
 
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 
 GAME_ID = 10640
 API_BASE = f"https://g-{GAME_ID}.modapi.io/v1"
 USER_AGENT = f"TpF3-Mod-Downloader/{VERSION}"
 
 MAX_RETRIES = 3
-MAX_DOWNLOAD_RETRIES = 3
+MAX_DOWNLOAD_RETRIES = 10
+# Сервер загрузки у части пользователей «залипает» после заголовков, и такое
+# соединение проще бросить и открыть новое, чем ждать. В норме первые данные
+# приходят за 1-2 секунды, поэтому ожидание 15 сек — с запасом для медленных сетей.
+DOWNLOAD_CONNECT_TIMEOUT = 15
+DOWNLOAD_READ_TIMEOUT = 15
+DOWNLOAD_RETRY_WAIT = 4
 
 MAX_EXTRACT_DIR_LEN = 150
 MAX_MOD_PATH_LEN = 200
@@ -884,7 +890,7 @@ def _print_retry_message(error, attempt):
         )
         return wait
 
-    wait = 5
+    wait = DOWNLOAD_RETRY_WAIT
     print(
         f"Обрыв связи, повтор через {wait} сек... "
         f"({attempt}/{MAX_DOWNLOAD_RETRIES})"
@@ -1143,6 +1149,67 @@ def validate_folder_name(name):
     return None
 
 
+# ---------- Общий ввод ----------
+
+_YES_WORDS = frozenset({"да", "д", "yes", "y"})
+_NO_WORDS = frozenset({"нет", "н", "no", "n"})
+
+
+def ask_yes_no(question, default=None):
+    """Вопрос да/нет. EOFError пробрасывается наружу.
+
+    Принимает да/д/yes/y и нет/н/no/n в любом регистре. На непонятный
+    ввод переспрашивает.
+    default — что значит пустой Enter: True («Да/нет»), False («да/Нет»);
+    None — пустой ввод не принимается. Для опасных вопросов (удаление,
+    продолжение при проблемах) ставим default=False."""
+    hint = {None: "да/нет", True: "Да/нет", False: "да/Нет"}[default]
+
+    while True:
+        answer = input(f"{question} ({hint}):\n> ").strip().lower()
+
+        if answer in _YES_WORDS:
+            return True
+
+        if answer in _NO_WORDS:
+            return False
+
+        if not answer and default is not None:
+            return default
+
+        print("Ответь «да» или «нет» (можно y / n).")
+
+
+def _join_or(values):
+    """['1', '2'] -> '1 или 2'; ['1', '2', '3'] -> '1, 2 или 3'."""
+    values = list(values)
+
+    if len(values) == 1:
+        return values[0]
+
+    return ", ".join(values[:-1]) + " или " + values[-1]
+
+
+def ask_choice(valid, default=None, shown=None):
+    """Выбор пункта меню по номеру. На непонятный ввод переспрашивает.
+
+    valid   — допустимые ответы, например ["1", "2"];
+    default — что вернуть на пустой Enter (None — не принимается);
+    shown   — что перечислять в подсказке (по умолчанию то же, что valid)."""
+    shown = shown or valid
+
+    while True:
+        choice = input("> ").strip()
+
+        if choice in valid:
+            return choice
+
+        if not choice and default is not None:
+            return default
+
+        print(f"Непонятный ответ. Введи {_join_or(shown)}.")
+
+
 def ask_folder_name(archive_name, intro=None):
     """Спрашивает имя папки у пользователя."""
     print()
@@ -1282,7 +1349,7 @@ def ask_file_mode():
     print()
 
     while True:
-        choice = input("> ").strip()
+        choice = ask_choice(["1", "2", "3"], shown=["1", "2"])
 
         if choice == str(MODE_FILE_ONE):
             return MODE_FILE_ONE
@@ -1307,8 +1374,6 @@ def ask_file_mode():
             print("Пока что выбери 1 или 2.")
             continue
 
-        print("Непонятный ответ. Введи 1 или 2.")
-
 
 def ask_name_mode():
     """Стартовое окно — выбор режима работы с именем папки."""
@@ -1318,15 +1383,12 @@ def ask_name_mode():
     print(f"  {MODE_NAME_MANUAL} — вручную")
     print()
 
-    while True:
-        choice = input("> ").strip()
+    choice = ask_choice([str(MODE_NAME_AUTO), str(MODE_NAME_MANUAL)])
 
-        if choice == str(MODE_NAME_AUTO):
-            return MODE_NAME_AUTO
-        if choice == str(MODE_NAME_MANUAL):
-            return MODE_NAME_MANUAL
+    if choice == str(MODE_NAME_AUTO):
+        return MODE_NAME_AUTO
 
-        print("Непонятный ответ. Введи 1 или 2.")
+    return MODE_NAME_MANUAL
 
 
 # ---------- Работа с API ----------
@@ -1613,20 +1675,6 @@ def _find_target_file(mod_id, api_key):
     return best[1] if best else None
 
 
-def _ask_yes_no(question):
-    """Вопрос да/нет. EOFError пробрасывается наружу."""
-    while True:
-        answer = input(f"{question} (да/нет):\n> ").strip().lower()
-
-        if answer in ("y", "yes", "д", "да"):
-            return True
-
-        if answer in ("n", "no", "н", "нет"):
-            return False
-
-        print("Ответь «да» или «нет».")
-
-
 def resolve_file_info(mod, mod_id, api_key, ask=True):
     """Выбирает файл мода для нашей платформы. Возвращает (file_id, file_info).
 
@@ -1692,7 +1740,7 @@ def resolve_file_info(mod, mod_id, api_key, ask=True):
         else "Всё равно скачать текущий файл?"
     )
 
-    if ask and not _ask_yes_no(question):
+    if ask and not ask_yes_no(question, default=False):
         return None, None
 
     return file_id, file_info
@@ -2063,7 +2111,7 @@ def download_zip(file_info, output_dir, fallback_name, api_key=None):
         print("  1 — перезаписать")
         print("  2 — сохранить рядом с другим именем (суффикс _1, _2, ...)")
         print("  3 — отменить")
-        choice = input("> ").strip()
+        choice = ask_choice(["1", "2", "3"])
 
         if choice == "2":
             i = 1
@@ -2098,7 +2146,11 @@ def download_zip(file_info, output_dir, fallback_name, api_key=None):
     download_ok = False
 
     for md5_attempt in range(1, MAX_MD5_ATTEMPTS + 1):
-        for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
+        # Счётчик ручной: после исчерпания попыток пользователь может
+        # попросить новый раунд, и тогда отсчёт идёт заново.
+        attempt = 0
+        while True:
+            attempt += 1
             md5 = hashlib.md5()
             total = 0
             server_size = None
@@ -2124,7 +2176,7 @@ def download_zip(file_info, output_dir, fallback_name, api_key=None):
                         "Accept": "*/*",
                     },
                     stream=True,
-                    timeout=(15, 90),
+                    timeout=(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT),
                 ) as response:
 
                     if response.status_code in (401, 403):
@@ -2264,6 +2316,13 @@ def download_zip(file_info, output_dir, fallback_name, api_key=None):
                 if attempt < MAX_DOWNLOAD_RETRIES:
                     wait = _print_retry_message(e, attempt)
                     time.sleep(wait)
+                    continue
+
+                print(f"Не удалось скачать за {MAX_DOWNLOAD_RETRIES} попыток.")
+
+                if ask_yes_no("Попробовать ещё раз?", default=True):
+                    print()
+                    attempt = 0
                     continue
 
                 try:
@@ -2748,9 +2807,7 @@ def extract_zip(zip_path, extract_root, mod_name=None, name_mode=MODE_NAME_AUTO,
                 print("Если ты не уверен, что там актуальная версия — выбери «да».")
                 print()
 
-                answer = input("Распаковать заново? (да/нет):\n> ").strip().lower()
-
-                if answer not in ("да", "д", "yes", "y"):
+                if not ask_yes_no("Распаковать заново?", default=False):
                     return None
 
                 if not confirm_delete_with_code():
@@ -2918,7 +2975,7 @@ def extract_zip(zip_path, extract_root, mod_name=None, name_mode=MODE_NAME_AUTO,
 
                     _show_crc_warning(crc_names, len(real_files), md5_verified)
 
-                    if not _ask_yes_no("Продолжить распаковку?"):
+                    if not ask_yes_no("Продолжить распаковку?", default=False):
                         raise ExtractionCancelled("Распаковка отменена пользователем.")
 
                     print()
@@ -3107,28 +3164,21 @@ def ask_about_existing_folder(folder_path, archive_name):
     print("=" * 60)
     print()
 
-    answer = input("Удалить её и заменить новой? (да/нет):\n> ").strip().lower()
-
-    if answer in ("нет", "н", "no", "n"):
+    if not ask_yes_no("Удалить её и заменить новой?", default=False):
         print()
         print("Хочешь ввести другое имя для папки этого мода?")
         print("  1 — ввести новое имя")
         print("  2 — отменить распаковку и выйти")
-        choice = input("> ").strip()
 
-        if choice == "1":
+        if ask_choice(["1", "2"]) == "1":
             return ask_folder_name(archive_name)
 
         return None
 
-    if answer in ("да", "д", "yes", "y"):
-        if not confirm_delete_with_code():
-            return None
+    if not confirm_delete_with_code():
+        return None
 
-        return _DELETE
-
-    print("Непонятный ответ — считаю отменой.")
-    return None
+    return _DELETE
 
 
 def record_extract_status(issues, name, status):
@@ -3372,19 +3422,14 @@ def _print_exceeded_menu():
 
 def _ask_exceeded_choice():
     """Спрашивает выбор из меню превышения лимита."""
-    while True:
-        choice = input("> ").strip()
+    choice = ask_choice(["1", "2", "3", "4"])
 
-        if choice == "1":
-            return "no_deps"
-        if choice == "2":
-            return "retry_url"
-        if choice == "3":
-            return "restart"
-        if choice == "4":
-            return "exit"
-
-        print("Непонятный ответ. Введи 1, 2, 3 или 4.")
+    return {
+        "1": "no_deps",
+        "2": "retry_url",
+        "3": "restart",
+        "4": "exit",
+    }[choice]
 
 
 def ask_exceeded_action():
@@ -3422,15 +3467,7 @@ def ask_api_error_with_zip_action():
     print("  1 — продолжить установку только с этим ZIP")
     print("  2 — закончить работу")
 
-    while True:
-        choice = input("> ").strip()
-
-        if choice == "1":
-            return "continue"
-        if choice == "2":
-            return "exit"
-
-        print("Непонятный ответ. Введи 1 или 2.")
+    return "continue" if ask_choice(["1", "2"]) == "1" else "exit"
 
 
 def ask_api_error_no_zip_action():
@@ -3440,15 +3477,7 @@ def ask_api_error_no_zip_action():
     print("  1 — скачать только основной мод (без зависимостей)")
     print("  2 — закончить работу")
 
-    while True:
-        choice = input("> ").strip()
-
-        if choice == "1":
-            return "continue"
-        if choice == "2":
-            return "exit"
-
-        print("Непонятный ответ. Введи 1 или 2.")
+    return "continue" if ask_choice(["1", "2"]) == "1" else "exit"
 
 
 def _ask_mod_without_card(mod_slug):
@@ -3852,4 +3881,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nОстановлено.")
         sys.exit(3)
-        sys.exit(1)
